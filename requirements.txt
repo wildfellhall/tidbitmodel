@@ -1,0 +1,6 @@
+# Python 3.10+; tested with Python 3.14, PyTorch 2.10, and Transformers 5.2.
+torch>=2.6,<3
+transformers==5.2.0
+tokenizers>=0.22,<0.23
+numpy>=1.26,<3
+requests>=2.32.5,<3
