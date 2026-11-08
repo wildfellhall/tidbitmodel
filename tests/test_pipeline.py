@@ -26,7 +26,13 @@ from tidbit.data import (
     split_documents,
     write_json,
 )
-from tidbit.training import ShuffledEpochSampler, build_model, sample_responses, train
+from tidbit.training import (
+    ShuffledEpochSampler,
+    build_model,
+    sample_responses,
+    train,
+    update_parameters,
+)
 
 
 class ParsingTests(unittest.TestCase):
@@ -380,9 +386,77 @@ class WorkflowTests(unittest.TestCase):
         summary = json.loads((output / "training_summary.json").read_text())
         self.assertTrue(summary["stopped_early"])
         self.assertLess(summary["steps"], args.max_steps)
-        self.assertGreaterEqual(summary["epochs_completed"], 1)
+        self.assertGreaterEqual(
+            summary["epochs_completed"], args.early_stopping_min_epochs
+        )
         state = torch.load(output / "model/training_state.pt", weights_only=True)
         self.assertTrue(state["completed"])
+
+    def test_skipped_update_retries_without_consuming_passages_or_schedule(self):
+        control, retried = self.root / "no-overflow", self.root / "retry-overflow"
+        args = self.training_args(control)
+        args.max_steps = 2
+        args.dropout = 0
+        with contextlib.redirect_stdout(io.StringIO()):
+            train(args)
+        args = self.training_args(retried)
+        args.max_steps = 2
+        args.dropout = 0
+        attempts = []
+
+        def update(*values):
+            attempts.append(1)
+            if len(attempts) == 1:
+                return torch.tensor(float("inf")), False
+            return update_parameters(*values)
+
+        with (
+            patch("tidbit.training.update_parameters", side_effect=update),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            train(args)
+        self.assertEqual(len(attempts), 3)
+        for filename in ("training_summary.json",):
+            self.assertEqual(
+                json.loads((control / filename).read_text()),
+                json.loads((retried / filename).read_text()),
+            )
+        original = GPT2LMHeadModel.from_pretrained(control / "model")
+        resumed = GPT2LMHeadModel.from_pretrained(retried / "model")
+        for name, tensor in original.state_dict().items():
+            torch.testing.assert_close(
+                tensor, resumed.state_dict()[name], rtol=0, atol=0
+            )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available(),
+        "CUDA GPU required for native FP16/fused-AdamW integration",
+    )
+    def test_cuda_fp16_checkpoint_resumes_scaler_and_optimizer(self):
+        output = self.root / "cuda-half"
+        args = self.training_args(output)
+        args.device, args.precision, args.max_steps = "cuda", "float16", 4
+        args.save_every, args.eval_every = 2, 2
+        with contextlib.redirect_stdout(io.StringIO()):
+            train(args)
+        state = torch.load(
+            output / "checkpoint-2/training_state.pt",
+            weights_only=True,
+            map_location="cpu",
+        )
+        self.assertIn("scale", state["scaler"])
+        args = self.training_args(self.root / "cuda-resumed", output / "checkpoint-2")
+        args.device, args.precision, args.max_steps = "cuda", "float16", 4
+        args.save_every, args.eval_every = 2, 2
+        with contextlib.redirect_stdout(io.StringIO()):
+            train(args)
+        final = torch.load(
+            self.root / "cuda-resumed/model/training_state.pt",
+            weights_only=True,
+            map_location="cpu",
+        )
+        self.assertEqual(final["step"], 4)
+        self.assertEqual(final["scaler"]["_growth_tracker"], 4)
 
     def test_101_steps_sample_at_100_resume_exactly_and_evaluate(self):
         output = self.root / "run"

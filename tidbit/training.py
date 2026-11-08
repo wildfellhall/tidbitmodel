@@ -216,10 +216,25 @@ def build_model(tokenizer, args):
 
 def precision_context(device, precision):
     return (
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if precision == "bfloat16"
+        torch.autocast(device_type="cuda", dtype=getattr(torch, precision))
+        if precision in {"bfloat16", "float16"}
         else nullcontext()
     )
+
+
+def learning_rate_factor(step, warmup_steps, max_steps, min_lr_ratio):
+    """Zero-based optimizer update: linear warmup, then cosine to the floor.
+
+    The last actual update uses the floor, rather than reaching it only after
+    training ends. With no warmup the first update uses the peak learning rate.
+    """
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    decay_start = max(0, warmup_steps - 1)
+    progress = min(
+        1.0, max(0.0, (step - decay_start) / max(1, max_steps - 1 - decay_start))
+    )
+    return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
 def configure_training(args, metadata):
@@ -235,17 +250,41 @@ def configure_training(args, metadata):
         metadata["passage_counts"]["train"]
         / (args.batch_size * args.gradient_accumulation)
     )
-    if args.max_steps is None:
+    if args.max_steps is None or args.max_steps == 0:
         args.max_steps = args.epochs * args.steps_per_epoch
+    if (
+        args.max_steps < 1
+        or not 0 <= args.warmup_ratio < 1
+        or not 0 <= args.min_lr_ratio <= 1
+    ):
+        raise ValueError(
+            "Invalid step budget, warmup ratio, or minimum learning-rate ratio."
+        )
+    if args.warmup_steps is None:
+        args.warmup_steps = math.ceil(args.max_steps * args.warmup_ratio)
+    if args.warmup_steps < 0:
+        raise ValueError("Warmup steps must be nonnegative.")
+    args.warmup_steps = min(args.warmup_steps, args.max_steps - 1)
     device = choose_device(args.device)
-    capable = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    capable = device.type == "cuda" and torch.cuda.is_bf16_supported(
+        including_emulation=False
+    )
     if args.precision == "auto":
-        args.precision = "bfloat16" if capable else "float32"
+        args.precision = (
+            "bfloat16" if capable else "float16" if device.type == "cuda" else "float32"
+        )
     if args.precision == "bfloat16" and not capable:
         raise ValueError(
             "BF16 training requires a supported CUDA GPU; use precision='float32'."
         )
+    if args.precision == "float16" and device.type != "cuda":
+        raise ValueError(
+            "FP16 training requires CUDA; use precision='float32' on Mac/CPU."
+        )
+    if args.precision not in {"float32", "bfloat16", "float16"}:
+        raise ValueError("Unknown precision setting.")
     args.attention_implementation = "sdpa" if device.type == "cuda" else "eager"
+    args.fused_optimizer = device.type == "cuda"
 
 
 def training_configuration(args):
@@ -262,17 +301,22 @@ def training_configuration(args):
             "max_steps",
             "epochs",
             "learning_rate",
+            "min_lr_ratio",
             "weight_decay",
             "warmup_steps",
+            "warmup_ratio",
             "seed",
             "precision",
             "attention_implementation",
+            "fused_optimizer",
             "eval_every",
             "eval_batches",
+            "eval_batch_size",
             "early_stopping_patience",
             "early_stopping_min_delta",
+            "early_stopping_min_epochs",
         )
-    } | {"training_version": 2}
+    } | {"training_version": 3}
 
 
 class ShuffledEpochSampler:
@@ -347,6 +391,7 @@ def save_checkpoint(
     device,
     progress=None,
     completed=False,
+    scaler=None,
 ):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -364,10 +409,28 @@ def save_checkpoint(
             "rng": rng_state(device),
             "progress": dict(progress or {}),
             "completed": completed,
+            "scaler": scaler.state_dict() if scaler is not None else {},
         },
         temporary,
     )
     temporary.replace(path / "training_state.pt")
+
+
+def update_parameters(model, optimizer, scaler):
+    """Unscale before clipping; report FP16 overflow without advancing training."""
+    scaler.unscale_(optimizer)
+    norm = torch.nn.utils.clip_grad_norm_(
+        model.parameters(), 1.0, error_if_nonfinite=not scaler.is_enabled()
+    )
+    previous_scale = scaler.get_scale()
+    scaler.step(optimizer)
+    scaler.update()
+    updated = not scaler.is_enabled() or scaler.get_scale() >= previous_scale
+    if updated and not torch.isfinite(norm):
+        raise ValueError(
+            "Non-finite gradient norm without a recoverable FP16 overflow."
+        )
+    return norm, updated
 
 
 def train(args):
@@ -386,6 +449,7 @@ def train(args):
             args.eval_every,
             args.save_every,
             args.log_every,
+            args.eval_batch_size,
         )
         <= 0
     ):
@@ -403,7 +467,11 @@ def train(args):
         )
     if args.learning_rate <= 0 or args.weight_decay < 0:
         raise ValueError("Learning rate must be positive and weight decay nonnegative.")
-    if args.early_stopping_patience < 0 or args.early_stopping_min_delta < 0:
+    if (
+        args.early_stopping_patience < 0
+        or args.early_stopping_min_delta < 0
+        or args.early_stopping_min_epochs < 0
+    ):
         raise ValueError("Early-stopping settings must be nonnegative.")
     if args.sample_max_new_tokens < 1:
         raise ValueError("sample-max-new-tokens must be positive.")
@@ -472,16 +540,20 @@ def train(args):
         },
         {"params": [p for p in model.parameters() if p.ndim < 2], "weight_decay": 0.0},
     ]
-    optimizer = torch.optim.AdamW(groups, lr=args.learning_rate, betas=(0.9, 0.95))
-    warmup = min(args.warmup_steps, max(0, args.max_steps - 1))
-
-    def learning_rate_factor(step):
-        if step < warmup:
-            return (step + 1) / max(1, warmup)
-        progress = min(1.0, (step - warmup) / max(1, args.max_steps - warmup))
-        return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_factor)
+    optimizer = torch.optim.AdamW(
+        groups,
+        lr=args.learning_rate,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        fused=args.fused_optimizer,
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=args.precision == "float16")
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda step: learning_rate_factor(
+            step, args.warmup_steps, args.max_steps, args.min_lr_ratio
+        ),
+    )
     sampler = ShuffledEpochSampler(
         len(training),
         args.seed + 1,
@@ -492,11 +564,13 @@ def train(args):
         "target_tokens_seen": 0,
         "bad_evaluations": 0,
         "patience_reference_loss": float("inf"),
+        "overflow_retries": 0,
     }
     start, best_loss = 0, float("inf")
     if state:
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
+        scaler.load_state_dict(state["scaler"])
         sampler.load_state_dict(state["sampler"])
         progress.update(state["progress"])
         restore_rng(state["rng"], device)
@@ -519,10 +593,13 @@ def train(args):
         f"Planned updates: {args.max_steps:,}; {args.steps_per_epoch:,} per complete shuffled epoch; precision={args.precision}.",
         flush=True,
     )
+    print(
+        f"Learning rate: {args.learning_rate:g} peak, {args.warmup_steps:,} warmup updates, cosine to {args.learning_rate * args.min_lr_ratio:g}; effective batch={args.batch_size * args.gradient_accumulation} passages.",
+        flush=True,
+    )
     stopped_early = False
     model.train()
     for step in range(start + 1, args.max_steps + 1):
-        optimizer.zero_grad(set_to_none=True)
         microbatches = []
         update_indices = sampler.take(args.batch_size * args.gradient_accumulation)
         for offset in range(0, len(update_indices), args.batch_size):
@@ -535,30 +612,40 @@ def train(args):
             targets = int((batch["labels"][:, 1:] != -100).sum().item())
             microbatches.append((batch, targets))
         total_targets = sum(targets for _, targets in microbatches)
-        train_loss = 0.0
-        for batch, targets in microbatches:
-            batch = {key: value.to(device) for key, value in batch.items()}
-            with precision_context(device, args.precision):
-                loss = model(**batch, use_cache=False).loss
-            if not torch.isfinite(loss):
-                raise ValueError(f"Non-finite training loss at step {step}.")
-            weight = targets / total_targets
-            (loss * weight).backward()
-            train_loss += loss.detach().item() * weight
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), 1.0, error_if_nonfinite=True
-        )
-        optimizer.step()
+        update_lr = optimizer.param_groups[0]["lr"]
+        for attempt in range(16):
+            optimizer.zero_grad(set_to_none=True)
+            train_loss = 0.0
+            for batch, targets in microbatches:
+                batch = {key: value.to(device) for key, value in batch.items()}
+                with precision_context(device, args.precision):
+                    loss = model(**batch, use_cache=False).loss
+                if not torch.isfinite(loss):
+                    raise ValueError(f"Non-finite training loss at step {step}.")
+                weight = targets / total_targets
+                scaler.scale(loss * weight).backward()
+                train_loss += loss.detach().item() * weight
+            grad_norm, updated = update_parameters(model, optimizer, scaler)
+            if updated:
+                break
+            progress["overflow_retries"] += 1
+            print(
+                f"FP16 overflow at update {step}; retrying the same passages at loss scale {scaler.get_scale():g}.",
+                flush=True,
+            )
+        else:
+            raise ValueError("Repeated FP16 overflow; retry with precision='float32'.")
         scheduler.step()
         progress["target_tokens_seen"] += total_targets
         if step == 1 or step % args.log_every == 0 or step == args.max_steps:
             metrics = {
                 "step": step,
                 "train_loss": train_loss,
-                "learning_rate": scheduler.get_last_lr()[0],
+                "learning_rate": update_lr,
                 "epochs_completed": sampler.progress,
                 "target_tokens_seen": progress["target_tokens_seen"],
                 "gradient_norm": float(grad_norm),
+                "overflow_retries": progress["overflow_retries"],
             }
             print(json.dumps(metrics), flush=True)
             append_json(output / "metrics.jsonl", metrics)
@@ -597,7 +684,7 @@ def train(args):
                 model,
                 validation,
                 device,
-                args.batch_size,
+                args.eval_batch_size,
                 args.eval_batches,
                 args.precision,
             )
@@ -625,10 +712,11 @@ def train(args):
                     run,
                     device,
                     progress,
+                    scaler=scaler,
                 )
             if (
                 args.early_stopping_patience
-                and sampler.progress >= 1
+                and sampler.progress >= args.early_stopping_min_epochs
                 and progress["bad_evaluations"] >= args.early_stopping_patience
             ):
                 stopped_early = True
@@ -650,6 +738,7 @@ def train(args):
                 run,
                 device,
                 progress,
+                scaler=scaler,
             )
     save_checkpoint(
         output / "model",
@@ -664,6 +753,7 @@ def train(args):
         device,
         progress,
         completed=True,
+        scaler=scaler,
     )
     write_json(
         output / "training_summary.json",

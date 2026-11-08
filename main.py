@@ -4,8 +4,8 @@
     python -m pip install -r requirements.txt
     python main.py prepare
     python main.py train
-    python main.py test --model-dir runs/tidbit-coherent/best
-    python main.py generate --model-dir runs/tidbit-coherent/best --prompt "A telescope is"
+    python main.py test --model-dir runs/tidbit-tuned/best
+    python main.py generate --model-dir runs/tidbit-tuned/best --prompt "A telescope is"
     python -m unittest discover -s tests -v
 
 Use each subcommand's --help for settings. Preparation reads corpus.py without
@@ -135,20 +135,20 @@ def parser():
     train.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("runs/tidbit-coherent"),
+        default=Path("runs/tidbit-tuned"),
         help="Run directory for metrics, samples, and checkpoints.",
     )
     train.add_argument(
         "--max-steps",
         type=int,
-        default=None,
-        help="Optional fixed-step budget overriding --epochs, useful for smoke tests.",
+        default=77271,
+        help="Current corpus: 77,271 updates = 3 epochs. Use 0 to derive from --epochs after corpus/batch changes.",
     )
     train.add_argument(
         "--epochs",
         type=int,
         default=3,
-        help="Complete shuffled passes through all training passages.",
+        help="Complete shuffled passes when --max-steps is 0 (automatic).",
     )
     train.add_argument(
         "--early-stopping-patience",
@@ -157,27 +157,33 @@ def parser():
         help="Validation checks without meaningful improvement; 0 disables stopping.",
     )
     train.add_argument(
+        "--early-stopping-min-epochs",
+        type=float,
+        default=2.0,
+        help="Do not stop for a plateau until this many complete passes.",
+    )
+    train.add_argument(
         "--early-stopping-min-delta",
         type=float,
-        default=0.005,
+        default=0.002,
         help="Cumulative validation-loss improvement needed to reset patience.",
     )
     train.add_argument(
         "--precision",
-        choices=["auto", "float32", "bfloat16"],
+        choices=["auto", "float32", "bfloat16", "float16"],
         default="auto",
-        help="Auto uses BF16 on supported CUDA GPUs, otherwise FP32.",
+        help="Auto: native BF16 on CUDA, otherwise scaled FP16 on CUDA; FP32 on Mac/CPU.",
     )
     train.add_argument(
         "--batch-size",
         type=int,
-        default=8,
+        default=32,
         help="Sequences per accumulation microbatch.",
     )
     train.add_argument(
         "--gradient-accumulation",
         type=int,
-        default=4,
+        default=1,
         help="Microbatches per optimizer update.",
     )
     train.add_argument(
@@ -198,11 +204,17 @@ def parser():
     train.add_argument(
         "--dropout",
         type=float,
-        default=0.1,
+        default=0.0,
         help="Attention, embedding, and residual dropout.",
     )
     train.add_argument(
-        "--learning-rate", type=float, default=3e-4, help="Peak AdamW learning rate."
+        "--learning-rate", type=float, default=6e-4, help="Peak AdamW learning rate."
+    )
+    train.add_argument(
+        "--min-lr-ratio",
+        type=float,
+        default=0.1,
+        help="Final learning rate divided by the peak (default floor: 6e-5).",
     )
     train.add_argument(
         "--weight-decay",
@@ -213,8 +225,14 @@ def parser():
     train.add_argument(
         "--warmup-steps",
         type=int,
-        default=200,
-        help="Warmup before cosine learning-rate decay.",
+        default=None,
+        help="Explicit warmup length; omitted means ceil(max-steps * warmup-ratio).",
+    )
+    train.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=0.02,
+        help="Fraction of updates for linear warmup when --warmup-steps is omitted.",
     )
     train.add_argument(
         "--eval-every",
@@ -225,8 +243,14 @@ def parser():
     train.add_argument(
         "--eval-batches",
         type=int,
-        default=128,
+        default=64,
         help="Validation batches per evaluation; zero evaluates the full split.",
+    )
+    train.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=16,
+        help="Separate validation batch size; defaults evaluate 1,024 fixed passages.",
     )
     train.add_argument(
         "--save-every",
@@ -273,7 +297,7 @@ def parser():
     test.add_argument(
         "--model-dir",
         type=Path,
-        default=Path("runs/tidbit-coherent/best"),
+        default=Path("runs/tidbit-tuned/best"),
         help="Local saved checkpoint or final model.",
     )
     test.add_argument(
@@ -318,7 +342,7 @@ def parser():
     generate.add_argument(
         "--model-dir",
         type=Path,
-        default=Path("runs/tidbit-coherent/best"),
+        default=Path("runs/tidbit-tuned/best"),
         help="Local saved checkpoint or final model.",
     )
     generate.add_argument(

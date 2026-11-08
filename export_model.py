@@ -2,8 +2,8 @@
 """Export a trained Tidbit checkpoint independently of the training cell.
 
     python -m pip install -r requirements-export.txt
-    python export_model.py export --model-dir runs/one_piece-coherent/best
-    python export_model.py export --model-dir runs/tidbit-coherent/best --outtype q8_0
+    python export_model.py export --model-dir runs/one_piece-tuned/best
+    python export_model.py export --model-dir runs/tidbit-tuned/best --outtype q8_0
     python export_model.py upload --export-dir runs/exports/tidbit --repo-id USER/tidbit
 
 Export creates a Hugging Face folder, its ZIP, and a GGUF in a NEW output
@@ -13,7 +13,7 @@ the exported files are already on disk. --hf-only skips GGUF conversion.
 
 Notebook use (after installing requirements-export.txt):
     from export_model import export_model, download_files, upload_export
-    result = export_model("runs/one_piece-coherent/best")
+    result = export_model("runs/one_piece-tuned/best")
     download_files(result["gguf"])
     # Only run this if you want to upload; authenticate using hf auth login
     # or HF_TOKEN first. New Hub repositories are private by default.
@@ -247,7 +247,14 @@ def export_model(
     if model_dir is None:
         candidates = [
             Path("runs") / run / kind
-            for run in ("one_piece-coherent", "tidbit-coherent", "one_piece", "tidbit")
+            for run in (
+                "one_piece-tuned",
+                "tidbit-tuned",
+                "one_piece-coherent",
+                "tidbit-coherent",
+                "one_piece",
+                "tidbit",
+            )
             for kind in ("best", "model")
         ]
         model_dir = next((p for p in candidates if (p / "config.json").is_file()), None)
