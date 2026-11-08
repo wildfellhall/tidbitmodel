@@ -250,4 +250,167 @@ sources = [
   "https://www.gutenberg.org/cache/epub/38831/pg38831.txt", #The Barb and the Bridle by active 1866-1874 Robert Henderson
   "https://www.gutenberg.org/cache/epub/37142/pg37142.txt", #How to Care for the Insane: A Manual for Nurses by William D. Granger
   "https://www.gutenberg.org/cache/epub/44604/pg44604.txt", #How to become an engineer : containing full instructions how to proceed in…
+  "https://www.gutenberg.org/cache/epub/74523/pg74523.txt", #A church dictionary by Walter Farquhar Hook
+  "https://www.gutenberg.org/cache/epub/37309/pg37309.txt", #Violins and Violin Makers by Joseph Pearce
+  "https://www.gutenberg.org/cache/epub/74485/pg74485.txt", #A handy dictionary of mythology : For everyday readers by Thomas Preston
+  "https://www.gutenberg.org/cache/epub/44040/pg44040.txt", #Worcestershire in the Nineteenth Century by T. C. Turberville
+  "https://www.gutenberg.org/cache/epub/67768/pg67768.txt", #Hand-book of Sanitary Information for Householders by Roger Sherman Tracy
+  "https://www.gutenberg.org/cache/epub/64140/pg64140.txt", #Soup and Soup Making by Emma P. Ewing
+  "https://www.gutenberg.org/cache/epub/78002/pg78002.txt", #The ladies' hand-book of millinery and dressmaking : With plain instructions…
+  "https://www.gutenberg.org/cache/epub/66524/pg66524.txt", #The Wine Press and the Cellar: A Manual for the Wine-Maker and the Cellar-Man
+  "https://www.gutenberg.org/cache/epub/58756/pg58756.txt", #A manual of pyrotechny : or, A familiar system of recreative fire-works
+  "https://www.gutenberg.org/cache/epub/60550/pg60550.txt", #The Science of Brickmaking by George Frederick Harris
+  "https://www.gutenberg.org/cache/epub/67942/pg67942.txt", #The honey bee: a manual of instruction in apiculture by Frank Benton
+  "https://www.gutenberg.org/cache/epub/68157/pg68157.txt", #Manual of the apiary by Albert John Cook
+  "https://www.gutenberg.org/cache/epub/32838/pg32838.txt", #The Canadian Curler's Manual by James Bicket
+  "https://www.gutenberg.org/cache/epub/29701/pg29701.txt", #The Mother's Manual of Children's Diseases by Charles West
+  "https://www.gutenberg.org/cache/epub/63517/pg63517.txt", #A Practical Manual of the Collodion Process, Giving in Detail a Method For…
+  "https://www.gutenberg.org/cache/epub/71782/pg71782.txt", #Steel : a manual for steel users by William Metcalf
+  "https://www.gutenberg.org/cache/epub/52850/pg52850.txt", #Barbers' Manual (Part 1); Text Book on Taxidermy (Part 2) by T. J. McConnaughay
+  "https://www.gutenberg.org/cache/epub/76043/pg76043.txt", #Every woman her own flower gardener : A handy manual of flower gardening for…
+  "https://www.gutenberg.org/cache/epub/62200/pg62200.txt", #Sabbath Defence Tactics: a manual by James Bridges
+  "https://www.gutenberg.org/cache/epub/12942/pg12942.txt", #The Highland Fling and How to Teach it by Horatio N. Grant
+  "https://www.gutenberg.org/cache/epub/67477/pg67477.txt", #Bee-keeping for the Many; or, The management of the common and Ligurian honey…
+  "https://www.gutenberg.org/cache/epub/67439/pg67439.txt", #The Bee Keeper's Guide, Third Edition by J. H. Payne
+  "https://www.gutenberg.org/cache/epub/57273/pg57273.txt", #The Stocking-Knitter's Manual: A Handy Book for the Work-Table by Cupples
+  "https://www.gutenberg.org/cache/epub/73434/pg73434.txt", #Prof. E. H. Crane's manual of instructions to undertakers : With full and…
+  "https://www.gutenberg.org/cache/epub/78603/pg78603.txt", #The harness makers' illustrated manual by William N. Fitz-Gerald
+  ##### LARGER BOOKS/TEXTBOOKS #####
+  "https://www.gutenberg.org/cache/epub/25717/pg25717.txt", #The History of the Decline and Fall of the Roman Empire by Edward Gibbon
+  "https://www.gutenberg.org/cache/epub/2464/pg2464.txt",   #History of Florence and of the Affairs of Italy by Niccolò Machiavelli
+  "https://www.gutenberg.org/cache/epub/25848/pg25848.txt", #William the Conqueror by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/27551/pg27551.txt", #Hannibal by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/26939/pg26939.txt", #Richard I by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/26734/pg26734.txt", #Charles I by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/27802/pg27802.txt", #Darius the Great by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/28433/pg28433.txt", #Richard II by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/25351/pg25351.txt", #Xerxes by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/27240/pg27240.txt", #Pyrrhus by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/28283/pg28283.txt", #Mary Queen of Scots by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/15400/pg15400.txt", #Renaissance in Italy, Volume 1 (of 7) by John Addington Symonds
+  "https://www.gutenberg.org/cache/epub/41924/pg41924.txt", #Renaissance in Italy, Volume 2 (of 7) by John Addington Symonds
+  "https://www.gutenberg.org/cache/epub/11559/pg11559.txt", #Renaissance in Italy, Volume 3 (of 7) by John Addington Symonds
+  "https://www.gutenberg.org/cache/epub/35792/pg35792.txt", #Renaissance in Italy, Volume 4 (of 7) by John Addington Symonds
+  "https://www.gutenberg.org/cache/epub/36448/pg36448.txt", #Renaissance in Italy, Volume 5 (of 7) by John Addington Symonds
+  "https://www.gutenberg.org/cache/epub/16504/pg16504.txt", #Renaissance in Italy, Volumes 6 and 7 (of 7) by John Addington Symonds
+  "https://www.gutenberg.org/cache/epub/30624/pg30624.txt", #Alexander the Great by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/28667/pg28667.txt", #Genghis Khan, Makers of History Series by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/27692/pg27692.txt", #Romulus by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/27312/pg27312.txt", #Nero by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/28561/pg28561.txt", #Richard III by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/40205/pg40205.txt", #History of Cleopatra, Queen of Egypt by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/29107/pg29107.txt", #Queen Elizabeth by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/10992/pg10992.txt", #Cleopatra by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/16545/pg16545.txt", #King Alfred of England by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/30707/pg30707.txt", #Cyrus the Great by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/21889/pg21889.txt", #Peter the Great by Jacob Abbott
+  "https://www.gutenberg.org/cache/epub/1972/pg1972.txt",   #History of the Britons (Historia Brittonum) by active 796 Nennius
+  "https://www.gutenberg.org/cache/epub/61475/pg61475.txt", #Byzantine Constantinople, the walls of the city and adjoining historical sites
+  "https://www.gutenberg.org/cache/epub/45815/pg45815.txt", #The Great Pestilence (A.D. 1348-9), Now Commonly Known as the Black Death
+  "https://www.gutenberg.org/cache/epub/44308/pg44308.txt", #The Art of War in the Middle Ages A.D. 378-1515 by Charles Oman
+  "https://www.gutenberg.org/cache/epub/42686/pg42686.txt", #A History of Epidemics in Britain, Volume 1 (of 2) by Charles Creighton
+  "https://www.gutenberg.org/cache/epub/43671/pg43671.txt", #A History of Epidemics in Britain, Volume 2 (of 2) by Charles Creighton
+  "https://www.gutenberg.org/cache/epub/28556/pg28556.txt", #History of Woman Suffrage, Volume III by Stanton, Anthony, and Gage
+  "https://www.gutenberg.org/cache/epub/22305/pg22305.txt", #The Naval History of the United States. Volume 1 by Willis J. Abbot
+  "https://www.gutenberg.org/cache/epub/26416/pg26416.txt", #The Naval History of the United States. Volume 2 by Willis J. Abbot
+  "https://www.gutenberg.org/cache/epub/15735/pg15735.txt", #History of the Negro Race in America from 1619 to 1880. Vol 1 by Williams
+  "https://www.gutenberg.org/cache/epub/21851/pg21851.txt", #History of the Negro Race in America from 1619 to 1880. Vol. 2 by Williams
+  "https://www.gutenberg.org/cache/epub/21990/pg21990.txt", #The Campaign of 1776 around New York and Brooklyn by Henry Phelps Johnston
+  "https://www.gutenberg.org/cache/epub/3072/pg3072.txt",   #Andersonville: A Story of Rebel Military Prisons by John McElroy
+  "https://www.gutenberg.org/cache/epub/21012/pg21012.txt", #The loyalists of America and their times : from 1620 to 1816, Vol. 1 of 2
+  "https://www.gutenberg.org/cache/epub/24658/pg24658.txt", #The loyalists of America and their times : from 1620 to 1816, Vol. 2 of 2
+  "https://www.gutenberg.org/cache/epub/25119/pg25119.txt", #The Conquest of Canada, Vol. 1 by George Warburton
+  "https://www.gutenberg.org/cache/epub/34862/pg34862.txt", #The Conquest of Canada, Vol. 2 by George Warburton
+  "https://www.gutenberg.org/cache/epub/27430/pg27430.txt", #The Critical Period of American History by John Fiske
+  "https://www.gutenberg.org/cache/epub/22131/pg22131.txt", #The Story of the Upper Canadian Rebellion, Volume 1 by John Charles Dent
+  "https://www.gutenberg.org/cache/epub/15263/pg15263.txt", #The Underground Railroad by William Still
+  "https://www.gutenberg.org/cache/epub/7142/pg7142.txt",   #The History of the Peloponnesian War by Thucydides
+  "https://www.gutenberg.org/cache/epub/2707/pg2707.txt",   #The History of Herodotus — Volume 1 by Herodotus
+  "https://www.gutenberg.org/cache/epub/2456/pg2456.txt",   #The History of Herodotus — Volume 2 by Herodotus
+  "https://www.gutenberg.org/cache/epub/46976/pg46976.txt", #The Anabasis of Alexander : or, The history of the wars and conquests of…
+  "https://www.gutenberg.org/cache/epub/2850/pg2850.txt",   #The Wars of the Jews; Or, The History of the Destruction of Jerusalem by Josephus
+  "https://www.gutenberg.org/cache/epub/1170/pg1170.txt",   #Anabasis by Xenophon
+  "https://www.gutenberg.org/cache/epub/6400/pg6400.txt",   #The Lives of the Twelve Caesars, Complete by Suetonius
+  "https://www.gutenberg.org/cache/epub/27114/pg27114.txt", #Ancient States and Empires by John Lord
+  "https://www.gutenberg.org/cache/epub/19725/pg19725.txt", #The History of Rome, Books 01 to 08 by Livy
+  "https://www.gutenberg.org/cache/epub/10907/pg10907.txt", #The History of Rome, Books 09 to 26 by Livy
+  "https://www.gutenberg.org/cache/epub/12582/pg12582.txt", #The History of Rome, Books 27 to 36 by Livy
+  "https://www.gutenberg.org/cache/epub/44318/pg44318.txt", #The History of Rome, Books 37 to the End by Livy
+  "https://www.gutenberg.org/cache/epub/1174/pg1174.txt",   #Hellenica by Xenophon
+  "https://www.gutenberg.org/cache/epub/26390/pg26390.txt", #The Two Great Retreats of History by George Grote and comte de Philippe-Paul Ségur
+  "https://www.gutenberg.org/cache/epub/16927/pg16927.txt", #Tacitus: The Histories, Volumes I and II by Cornelius Tacitus
+  "https://www.gutenberg.org/cache/epub/57374/pg57374.txt", #Annals and Antiquities of Rajasthan, v. 1 of 3 by James Tod
+  "https://www.gutenberg.org/cache/epub/57375/pg57375.txt", #Annals and Antiquities of Rajasthan, v. 2 of 3 by James Tod
+  "https://www.gutenberg.org/cache/epub/57376/pg57376.txt", #Annals and Antiquities of Rajasthan, v. 3 of 3 by James Tod
+  "https://www.gutenberg.org/cache/epub/2124/pg2124.txt",   #A Record of Buddhistic Kingdoms by Faxian
+  "https://www.gutenberg.org/cache/epub/49403/pg49403.txt", #The Seri Indians. (1898 N 17 / 1895-1896 (pages 1-344*)) by W J McGee
+  "https://www.gutenberg.org/cache/epub/23224/pg23224.txt", #Historical Introduction to Studies Among the Sedentary Indians of New Mexico;…
+  "https://www.gutenberg.org/cache/epub/20218/pg20218.txt", #History of the Incas by Pedro Sarmiento de Gamboa
+  "https://www.gutenberg.org/cache/epub/37887/pg37887.txt", #Mexico, Aztec, Spanish and Republican, Vol. 1 of 2 by Brantz Mayer
+  "https://www.gutenberg.org/cache/epub/49538/pg49538.txt", #Mexico, Aztec, Spanish and Republican, Vol. 2 of 2 by Brantz Mayer
+  "https://www.gutenberg.org/cache/epub/1301/pg1301.txt",   #The French Revolution: A History by Thomas Carlyle
+  "https://www.gutenberg.org/cache/epub/17450/pg17450.txt", #The Part Borne by the Dutch in the Discovery of Australia 1606-1765 by J. E. Heeres
+  "https://www.gutenberg.org/cache/epub/22762/pg22762.txt", #History of the Rise of the Huguenots, Vol. 1 by Henry Martyn Baird
+  "https://www.gutenberg.org/cache/epub/30708/pg30708.txt", #History of the Rise of the Huguenots, Vol. 2 by Henry Martyn Baird
+  "https://www.gutenberg.org/cache/epub/16764/pg16764.txt", #History of the Wars, Books I and II: The Persian War by Procopius
+  "https://www.gutenberg.org/cache/epub/16765/pg16765.txt", #History of the Wars, Books III and IV: The Vandalic War by Procopius
+  "https://www.gutenberg.org/cache/epub/20298/pg20298.txt", #History of the Wars, Books V and VI: The Gothic War by Procopius
+  "https://www.gutenberg.org/cache/epub/17037/pg17037.txt", #History of the English People, Volume I by John Richard Green
+  "https://www.gutenberg.org/cache/epub/17038/pg17038.txt", #History of the English People, Volume II by John Richard Green
+  "https://www.gutenberg.org/cache/epub/20812/pg20812.txt", #History of the English People, Volume III by John Richard Green
+  "https://www.gutenberg.org/cache/epub/23317/pg23317.txt", #History of the English People, Volume IV by John Richard Green
+  "https://www.gutenberg.org/cache/epub/23642/pg23642.txt", #History of the English People, Volume V by John Richard Green
+  "https://www.gutenberg.org/cache/epub/24254/pg24254.txt", #History of the English People, Volume VI by John Richard Green
+  "https://www.gutenberg.org/cache/epub/25261/pg25261.txt", #History of the English People, Volume VII by John Richard Green
+  "https://www.gutenberg.org/cache/epub/25536/pg25536.txt", #History of the English People, Volume VIII by John Richard Green
+  "https://www.gutenberg.org/cache/epub/33504/pg33504.txt", #Opticks : or, A treatise of the reflections, refractions, inflections and…
+  "https://www.gutenberg.org/cache/epub/22062/pg22062.txt", #The Mathematicall Praeface to Elements of Geometrie of Euclid of Megara by John Dee
+  "https://www.gutenberg.org/cache/epub/26752/pg26752.txt", #The Way To Geometry by Petrus Ramus
+  "https://www.gutenberg.org/cache/epub/21076/pg21076.txt", #The First Six Books of the Elements of Euclid by Euclid and John Casey
+  "https://www.gutenberg.org/cache/epub/68662/pg68662.txt", #Elements of arithmetic by Augustus De Morgan
+  "https://www.gutenberg.org/cache/epub/5000/pg5000.txt",   #The Notebooks of Leonardo Da Vinci — Complete by da Vinci Leonardo
+  "https://www.gutenberg.org/cache/epub/50572/pg50572.txt", #Goethe's Theory of Colours by Johann Wolfgang von Goethe
+  "https://www.gutenberg.org/cache/epub/14986/pg14986.txt", #Experimental Researches in Electricity, Volume 1 by Michael Faraday
+  "https://www.gutenberg.org/cache/epub/46036/pg46036.txt", #The sidereal messenger of Galileo Galilei : and a part of the preface to…
+  "https://www.gutenberg.org/cache/epub/37729/pg37729.txt", #A Discourse Presented to the Most Serene Don Cosimo II., Great Duke of Tuscany,…
+  "https://www.gutenberg.org/cache/epub/13476/pg13476.txt", #Experiments with Alternate Currents of High Potential and High Frequency by Tesla
+  "https://www.gutenberg.org/cache/epub/33810/pg33810.txt", #On the magnet, magnetick bodies also, and on the great magnet the earth by Gilbert et al.
+  "https://www.gutenberg.org/cache/epub/41839/pg41839.txt", #The Boy's Playbook of Science by John Henry Pepper
+  "https://www.gutenberg.org/cache/epub/45515/pg45515.txt", #Experiments and Observations on Electricity Made at Philadelphia in America
+  "https://www.gutenberg.org/cache/epub/54969/pg54969.txt", #Sound by John Tyndall
+  "https://www.gutenberg.org/cache/epub/63803/pg63803.txt", #The Forms of Water in Clouds and Rivers, Ice and Glaciers by John Tyndall
+  "https://www.gutenberg.org/cache/epub/52869/pg52869.txt", #On the Connexion of the Physical Sciences by Mary Somerville
+  "https://www.gutenberg.org/cache/epub/55886/pg55886.txt", #On Molecular and Microscopic Science, Volume 1 (of 2) by Mary Somerville
+  "https://www.gutenberg.org/cache/epub/57566/pg57566.txt", #On Molecular and Microscopic Science, Volume 2 (of 2) by Mary Somerville
+  "https://www.gutenberg.org/cache/epub/71191/pg71191.txt", #The celestial worlds discover'd : or, conjectures concerning the inhabitants,…
+  "https://www.gutenberg.org/cache/epub/30775/pg30775.txt", #Elements of Chemistry, by Antoine Laurent Lavoisier
+  "https://www.gutenberg.org/cache/epub/51326/pg51326.txt", #The Principles of Chemistry, Volume I by Dmitry Ivanovich Mendeleyev
+  "https://www.gutenberg.org/cache/epub/54210/pg54210.txt", #The Principles of Chemistry, Volume II by Dmitry Ivanovich Mendeleyev
+  "https://www.gutenberg.org/cache/epub/74240/pg74240.txt", #The works of the highly experienced and famous chymist, John Rudolph Glauber…
+  "https://www.gutenberg.org/cache/epub/63355/pg63355.txt", #Studies on fermentation : the diseases of beer, their causes, and the means of…
+  "https://www.gutenberg.org/cache/epub/29734/pg29734.txt", #Experiments and Observations on Different Kinds of Air by Joseph Priestley
+  "https://www.gutenberg.org/cache/epub/37682/pg37682.txt", #Heads of Lectures on a Course of Experimental Philosophy: Particularly…
+  "https://www.gutenberg.org/cache/epub/61112/pg61112.txt", #A New Light of Alchymie by Michal Sedziwój and Paracelsus
+  "https://www.gutenberg.org/cache/epub/46998/pg46998.txt", #Elements of the Theory and Practice of Chymistry, 5th ed. by Pierre Joseph Macquer
+  "https://www.gutenberg.org/cache/epub/58393/pg58393.txt", #The Mirror of Alchimy by Roger Bacon
+  "https://www.gutenberg.org/cache/epub/1228/pg1228.txt",   #On the Origin of Species By Means of Natural Selection by Charles Darwin
+  "https://www.gutenberg.org/cache/epub/2300/pg2300.txt",   #The Descent of Man, and Selection in Relation to Sex by Charles Darwin
+  "https://www.gutenberg.org/cache/epub/24923/pg24923.txt", #The Variation of Animals and Plants Under Domestication, Vol. I. by Charles Darwin
+  "https://www.gutenberg.org/cache/epub/1227/pg1227.txt",   #The Expression of the Emotions in Man and Animals by Charles Darwin
+  "https://www.gutenberg.org/cache/epub/22728/pg22728.txt", #The Foundations of the Origin of Species by Charles Darwin
+  "https://www.gutenberg.org/cache/epub/2355/pg2355.txt",   #The Formation of Vegetable Mould Through the Action of Worms by Charles Darwin
+  "https://www.gutenberg.org/cache/epub/28897/pg28897.txt", #The Variation of Animals and Plants Under Domestication, Volume II (of 2) by Darwin
+  "https://www.gutenberg.org/cache/epub/2485/pg2485.txt",   #The Movements and Habits of Climbing Plants by Charles Darwin
+  "https://www.gutenberg.org/cache/epub/3807/pg3807.txt",   #The Different Forms of Flowers on Plants of the Same Species by Charles Darwin
+  "https://www.gutenberg.org/cache/epub/2690/pg2690.txt",   #Coral Reefs by Charles Darwin
+  "https://www.gutenberg.org/cache/epub/5765/pg5765.txt",   #Insectivorous Plants by Charles Darwin
+  "https://www.gutenberg.org/cache/epub/5605/pg5605.txt",   #The Power of Movement in Plants by Charles Darwin and Sir Francis Darwin
+  "https://www.gutenberg.org/cache/epub/3054/pg3054.txt",   #Volcanic Islands by Charles Darwin
+  "https://www.gutenberg.org/cache/epub/23354/pg23354.txt", #Vegetable Teratology by Maxwell T. Masters
+  "https://www.gutenberg.org/cache/epub/15491/pg15491.txt", #Micrographia by Robert Hooke
+  "https://www.gutenberg.org/cache/epub/72894/pg72894.txt", #On the mode of communication of cholera by John Snow
+  "https://www.gutenberg.org/cache/epub/68315/pg68315.txt", #On chloroform and other anæsthetics: their action and administration by John Snow
+
+  
+
 ]
