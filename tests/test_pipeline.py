@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -15,16 +16,101 @@ from main import main, parser
 from tidbit.data import (
     TokenBlocks,
     clean_text,
+    document_identity,
     download_url,
+    fetch_source,
     load_sources,
+    passage_tokens,
     prepare,
+    prose_paragraphs,
     split_documents,
     write_json,
 )
-from tidbit.training import build_model, sample_responses, train
+from tidbit.training import ShuffledEpochSampler, build_model, sample_responses, train
 
 
 class ParsingTests(unittest.TestCase):
+    def test_prose_filter_keeps_question_answer_pairs_and_removes_numeric_lists(self):
+        text = "Q. What is steam?\n\nA. It is water in its gaseous state.\n\n12 43 99 100 78.\n\nCHAPTER I"
+        kept = list(prose_paragraphs(text))
+        self.assertEqual(len(kept), 1)
+        self.assertIn("Q. What is steam?\nA.", kept[0])
+
+    def test_work_families_are_not_split_across_train_validation_test(self):
+        docs = [{"sha256": str(i), "group": str(i // 2)} for i in range(20)]
+        assigned = split_documents(docs, 0.1, 0.1, 42)
+        for group in {d["group"] for d in assigned}:
+            self.assertEqual(
+                len({d["split"] for d in assigned if d["group"] == group}), 1
+            )
+
+    def test_sampler_covers_each_epoch_once_and_resumes_mid_epoch(self):
+        lengths = np.arange(11) + 2
+        sampler = ShuffledEpochSampler(11, 42, lengths, batch_size=4)
+        first = sampler.take(4)
+        resumed = ShuffledEpochSampler(11, 7, lengths, batch_size=4)
+        resumed.load_state_dict(sampler.state_dict())
+        for _ in range(2):
+            more = sampler.take(4)
+            self.assertEqual(more, resumed.take(4))
+            first.extend(more)
+        self.assertEqual(sorted(first), list(range(11)))
+        self.assertEqual(sampler.progress, 1)
+        second = []
+        for _ in range(3):
+            more = sampler.take(4)
+            self.assertEqual(more, resumed.take(4))
+            second.extend(more)
+        self.assertEqual(sorted(second), list(range(11)))
+        self.assertEqual(sampler.progress, 2)
+
+    def test_volume_titles_share_a_work_family(self):
+        first = document_identity(
+            "Title: Roman History, Books I-III\nAuthor: An Author\n*** START",
+            "fallback",
+        )
+        second = document_identity(
+            "Title: Roman History, Books IV-VI\nAuthor: An Author\n*** START",
+            "fallback",
+        )
+        unrelated = document_identity(
+            "Title: Other History\nAuthor: An Author\n*** START", "fallback"
+        )
+        self.assertEqual(first[1], second[1])
+        self.assertNotEqual(first[1], unrelated[1])
+
+    def test_missing_generated_text_uses_a_validated_legacy_mirror_file(self):
+        session = MagicMock()
+        missing, found = MagicMock(), MagicMock()
+        missing.__enter__.return_value = missing
+        found.__enter__.return_value = found
+        missing.status_code, found.status_code = 404, 200
+        body = (
+            "*** START OF THE PROJECT GUTENBERG EBOOK TEST ***\n"
+            + "A clear sentence about stars. " * 20
+            + "\n*** END OF THE PROJECT GUTENBERG EBOOK TEST ***"
+        )
+        found.iter_content.return_value = [body.encode()]
+        session.get.side_effect = [missing, found]
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            destination = Path(folder) / "download.txt"
+            fetch_source(
+                session,
+                "https://www.gutenberg.org/cache/epub/1234/pg1234.txt",
+                "https://example.org/gutenberg-epub",
+                destination,
+                0,
+            )
+            self.assertEqual(destination.read_text(), body)
+            self.assertFalse(destination.with_suffix(".part").exists())
+        self.assertEqual(
+            session.get.call_args.args[0],
+            "https://example.org/gutenberg/1/2/3/1234/1234-0.txt",
+        )
+
     def test_literal_sources_are_not_executed_and_urls_are_deduplicated(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "sources.py"
@@ -154,6 +240,10 @@ class WorkflowTests(unittest.TestCase):
                 str(cls.root / "cache"),
                 "--vocab-size",
                 "512",
+                "--context",
+                "32",
+                "--min-document-words",
+                "0",
             ]
         )
         with contextlib.redirect_stdout(io.StringIO()):
@@ -209,6 +299,8 @@ class WorkflowTests(unittest.TestCase):
         metadata = json.loads((self.data / "metadata.json").read_text())
         self.assertEqual(len(metadata["documents"]), 8)
         self.assertEqual(len(metadata["duplicate_sources"]), 1)
+        self.assertGreater(metadata["filter_counts"]["duplicate_paragraphs"], 0)
+        self.assertEqual(metadata["format_version"], 2)
         self.assertEqual(
             {d["split"] for d in metadata["documents"]}, {"train", "validation", "test"}
         )
@@ -216,11 +308,81 @@ class WorkflowTests(unittest.TestCase):
             self.data / "tokenizer", local_files_only=True
         )
         unseen = "Unseen text: π, café, and 123."
+        self.assertEqual(tokenizer.encode(unseen)[0], tokenizer.bos_token_id)
         self.assertEqual(
             tokenizer.decode(tokenizer.encode(unseen, add_special_tokens=False)), unseen
         )
         with self.assertRaisesRegex(ValueError, "already exists"):
             prepare(parser().parse_args(["prepare", "--data-dir", str(self.data)]))
+
+    def test_generation_uses_the_training_bos_even_after_prompt_truncation(self):
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(self.data / "tokenizer")
+        model = build_model(tokenizer, self.training_args(self.root / "unused"))
+        for prompt in ("", "A definition", "A definition " * 40):
+            with patch.object(
+                model, "generate", side_effect=lambda **kw: kw["input_ids"]
+            ) as generate:
+                sample_responses(model, tokenizer, [prompt], torch.device("cpu"), 8, 0)
+            ids = generate.call_args.kwargs["input_ids"][0].tolist()
+            self.assertEqual(ids[0], tokenizer.bos_token_id)
+            self.assertLessEqual(len(ids) + 8, model.config.n_positions)
+            self.assertEqual(ids.count(tokenizer.bos_token_id), 1)
+
+    def test_passages_preserve_tokens_and_do_not_teach_eos_at_hard_cuts(self):
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(self.data / "tokenizer")
+        text = "An unusually long explanation " * 20 + "ends here. A final sentence."
+        rows = list(
+            passage_tokens(
+                text,
+                tokenizer.backend_tokenizer,
+                32,
+                tokenizer.bos_token_id,
+                tokenizer.eos_token_id,
+            )
+        )
+        restored = []
+        self.assertTrue(any(row[-1] != tokenizer.eos_token_id for row in rows[:-1]))
+        for row in rows:
+            self.assertLessEqual(len(row), 32)
+            self.assertEqual(row[0], tokenizer.bos_token_id)
+            restored.extend(row[1:-1] if row[-1] == tokenizer.eos_token_id else row[1:])
+        self.assertEqual(restored, tokenizer.encode(text, add_special_tokens=False))
+        self.assertEqual(rows[-1][-1], tokenizer.eos_token_id)
+        data = TokenBlocks(self.data, "train", 32, tokenizer.pad_token_id)
+        targets = sum(
+            int((data[i]["labels"][1:] != -100).sum()) for i in range(len(data))
+        )
+        metadata = json.loads((self.data / "metadata.json").read_text())
+        self.assertEqual(targets, metadata["target_counts"]["train"])
+
+    def test_epoch_budget_consumes_exactly_two_passes_including_partial_batches(self):
+        output = self.root / "epochs-run"
+        args = self.training_args(output)
+        args.max_steps, args.epochs, args.early_stopping_patience = None, 2, 0
+        with contextlib.redirect_stdout(io.StringIO()):
+            train(args)
+        summary = json.loads((output / "training_summary.json").read_text())
+        metadata = json.loads((self.data / "metadata.json").read_text())
+        self.assertEqual(summary["epochs_completed"], 2)
+        self.assertEqual(
+            summary["target_tokens_seen"], 2 * metadata["target_counts"]["train"]
+        )
+
+    def test_early_stopping_saves_a_terminal_checkpoint(self):
+        output = self.root / "early-stop"
+        args = self.training_args(output)
+        args.eval_every, args.early_stopping_patience = 1, 2
+        with (
+            patch("tidbit.training.evaluate", return_value={"loss": 5.0}),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            train(args)
+        summary = json.loads((output / "training_summary.json").read_text())
+        self.assertTrue(summary["stopped_early"])
+        self.assertLess(summary["steps"], args.max_steps)
+        self.assertGreaterEqual(summary["epochs_completed"], 1)
+        state = torch.load(output / "model/training_state.pt", weights_only=True)
+        self.assertTrue(state["completed"])
 
     def test_101_steps_sample_at_100_resume_exactly_and_evaluate(self):
         output = self.root / "run"

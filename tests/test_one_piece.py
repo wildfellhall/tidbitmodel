@@ -30,6 +30,22 @@ def literal_assignment(tree, name):
 
 
 class OnePieceTests(unittest.TestCase):
+    def test_shared_training_and_parsing_implementations_stay_synchronized(self):
+        from tools.sync_one_piece import definitions
+
+        standalone = definitions(ROOT / "one_piece.py")
+        for filename, omitted in (
+            ("data.py", {"load_sources", "prepare"}),
+            ("training.py", {"read_prompts", "generate"}),
+        ):
+            for name, implementation in definitions(ROOT / "tidbit" / filename).items():
+                if name not in omitted:
+                    self.assertEqual(
+                        ast.dump(ast.parse(implementation)),
+                        ast.dump(ast.parse(standalone[name])),
+                        name,
+                    )
+
     def test_corpus_is_embedded_and_imports_are_independent(self):
         script = ast.parse((ROOT / "one_piece.py").read_text())
         corpus = ast.parse((ROOT / "corpus.py").read_text())
@@ -82,6 +98,7 @@ class OnePieceTests(unittest.TestCase):
                     "device": "cpu",
                     "threads": 1,
                     "vocab_size": 512,
+                    "min_document_words": 0,
                     "max_steps": 101,
                     "batch_size": 2,
                     "gradient_accumulation": 2,

@@ -1,11 +1,12 @@
-"""Download, clean, split by book, and tokenize the literal list in corpus.py.
+"""Download, clean, split by work family, and tokenize corpus.py into passages.
 
-The parser preserves historical prose, numbers, equations, and Q&A wording.
-It removes Gutenberg wrappers and reflows lines; it does not fact-check the
-books or claim to remove every index, table, or near-duplicate edition.
+The parser selects prose and Q&A, removes exact duplicate paragraphs and
+Gutenberg wrappers, and reflows lines. This formatting heuristic does not
+fact-check books or remove every index, table, or near-duplicate edition.
 """
 
 import ast
+import bisect
 import hashlib
 import io
 import json
@@ -134,6 +135,112 @@ def clean_text(raw, require_wrappers=False):
     return cleaned + "\n"
 
 
+def prose_paragraphs(text, min_words=8):
+    """Conservative prose selection, including adjacent question/answer pairs.
+
+    This is a formatting filter, not a factual or semantic quality classifier.
+    All removed text remains available in the raw download cache.
+    """
+    paragraphs = re.split(r"\n\s*\n", text)
+    pending = []
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+        if re.match(r"^(?:Q\.|Q:|Question\b)", paragraph, re.IGNORECASE):
+            pending.append(paragraph)
+            continue
+        if pending:
+            paragraph = "\n".join(pending + [paragraph])
+            pending = []
+        if len(paragraph.split()) < min_words:
+            continue
+        if re.match(
+            r"^(?:\[?transcriber|produced by|etext prepared|credits:)",
+            paragraph,
+            re.IGNORECASE,
+        ):
+            continue
+        visible = sum(not ch.isspace() for ch in paragraph)
+        letters = sum(ch.isalpha() for ch in paragraph)
+        if not visible or letters / visible < 0.65:
+            continue
+        if not re.search(r"[.!?](?:\s|$|[\"”’\]])", paragraph):
+            continue
+        yield paragraph
+
+
+def document_identity(raw, fallback):
+    """Keep volumes/editions of the same titled work in one held-out split."""
+    header = raw[: raw.find("*** START") if "*** START" in raw else 2000]
+    title = re.search(r"^Title:\s*(.+)", header, re.MULTILINE)
+    author = re.search(r"^Author:\s*(.+)", header, re.MULTILINE)
+    title = title[1].strip() if title else fallback
+    family = re.sub(
+        r"\b(?:volumes?|vol\.?|parts?|books?)\s+[\divxlcdm]+\b.*",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    family = re.sub(r"\W+", " ", family.casefold()).strip()
+    return title, family + "|" + (author[1].casefold().strip() if author else "")
+
+
+def passage_tokens(text, backend, context, bos, eos):
+    """Prefer sentence boundaries; never combine paragraphs from different books.
+
+    A long sentence can require a hard cut. Such cuts do not receive an EOS
+    target: the model must not learn that arbitrary token limits end a thought.
+    """
+    encoding = backend.encode(text, add_special_tokens=False)
+    ids = encoding.ids
+    ends = [end for _, end in encoding.offsets]
+    boundaries = {
+        bisect.bisect_right(ends, m.end())
+        for m in re.finditer(r"[.!?][\"”’\])]*(?=\s|$)", text)
+    }
+    boundaries.add(len(ids))
+    start, limit = 0, context - 2
+    while start < len(ids):
+        cap = min(start + limit, len(ids))
+        candidates = [b for b in boundaries if start + max(1, limit // 4) <= b <= cap]
+        end = max(candidates) if candidates else cap
+        yield [bos] + ids[start:end] + ([eos] if end in boundaries else [])
+        start = end
+
+
+def fetch_source(session, source, mirror, destination, delay):
+    """Try the generated mirror, then its legacy text paths on a missing file."""
+    primary = download_url(source, mirror)
+    candidates = [primary]
+    match = re.search(r"/cache/epub/(\d+)/pg\d+\.txt$", urlparse(source).path)
+    if match and mirror.rstrip("/").endswith("/gutenberg-epub"):
+        book = match[1]
+        legacy = mirror.rstrip("/").rsplit("/", 1)[0] + "/gutenberg/"
+        legacy += "/".join(book[:-1]) + "/" + book + "/" + book
+        candidates.extend([legacy + "-0.txt", legacy + ".txt"])
+    part = destination.with_suffix(".part")
+    try:
+        for index, url in enumerate(candidates):
+            try:
+                with session.get(url, timeout=(10, 60), stream=True) as response:
+                    if response.status_code == 404 and index + 1 < len(candidates):
+                        continue
+                    response.raise_for_status()
+                    with part.open("wb") as stream:
+                        for chunk in response.iter_content(chunk_size=65536):
+                            stream.write(chunk)
+                clean_text(
+                    part.read_text(encoding="utf-8-sig"), require_wrappers=bool(match)
+                )
+                part.replace(destination)
+                if index:
+                    print(f"Using legacy Gutenberg text: {url}", flush=True)
+                return
+            finally:
+                time.sleep(delay)
+    finally:
+        part.unlink(missing_ok=True)
+
+
 def split_documents(documents, validation_fraction, test_fraction, seed):
     if (
         validation_fraction <= 0
@@ -147,21 +254,35 @@ def split_documents(documents, validation_fraction, test_fraction, seed):
         raise ValueError(
             "At least three distinct books are needed for train/validation/test splits."
         )
-    shuffled = list(documents)
-    random.Random(seed).shuffle(shuffled)
-    n_validation = max(1, round(len(shuffled) * validation_fraction))
-    n_test = max(1, round(len(shuffled) * test_fraction))
-    if n_validation + n_test >= len(shuffled):
-        raise ValueError("Split fractions leave no training books.")
-    for index, document in enumerate(shuffled):
-        document["split"] = (
-            "validation"
-            if index < n_validation
-            else "test"
-            if index < n_validation + n_test
-            else "train"
+    groups = {}
+    for document in documents:
+        groups.setdefault(document.get("group", document["sha256"]), []).append(
+            document
         )
-    return shuffled
+    grouped = list(groups.values())
+    if len(grouped) < 3:
+        raise ValueError(
+            "At least three independent work families are needed for held-out splits."
+        )
+    random.Random(seed).shuffle(grouped)
+    result = []
+    for split, fraction in (
+        ("validation", validation_fraction),
+        ("test", test_fraction),
+    ):
+        target, count = max(1, round(len(documents) * fraction)), 0
+        reserved = 2 if split == "validation" else 1
+        while count < target and len(grouped) > reserved:
+            group = grouped.pop(0)
+            for document in group:
+                document["split"] = split
+            result.extend(group)
+            count += len(group)
+    for group in grouped:
+        for document in group:
+            document["split"] = "train"
+        result.extend(group)
+    return result
 
 
 def text_chunks(path, size=16384):
@@ -172,9 +293,20 @@ def text_chunks(path, size=16384):
 
 
 def prepare(args):
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    from tokenizers import (
+        Tokenizer,
+        decoders,
+        models,
+        pre_tokenizers,
+        processors,
+        trainers,
+    )
     from transformers import PreTrainedTokenizerFast
 
+    if args.context < 16 or args.min_document_words < 0 or args.min_paragraph_words < 1:
+        raise ValueError(
+            "Context must be >=16 and text-filter thresholds must be nonnegative."
+        )
     if not 259 <= args.vocab_size <= 65535:
         raise ValueError(
             "vocab-size must be between 259 and 65535 for byte BPE and uint16 storage."
@@ -216,6 +348,12 @@ def prepare(args):
             staging = Path(temporary)
             (staging / "clean").mkdir()
             documents, failures, duplicates, hashes = [], [], [], set()
+            paragraph_hashes, exclusions = set(), []
+            filter_counts = {
+                "input_words": 0,
+                "retained_words": 0,
+                "duplicate_paragraphs": 0,
+            }
             for index, entry in enumerate(entries, 1):
                 source = entry["source"]
                 try:
@@ -225,31 +363,17 @@ def prepare(args):
                         "www.gutenberg.org",
                     }
                     if is_remote:
-                        url = download_url(source, args.mirror)
                         raw_path = cache / (
                             hashlib.sha256(source.encode()).hexdigest() + ".txt"
                         )
                         if not raw_path.exists():
-                            part = raw_path.with_suffix(".part")
-                            try:
-                                with session.get(
-                                    url, timeout=(10, 60), stream=True
-                                ) as response:
-                                    response.raise_for_status()
-                                    with part.open("wb") as stream:
-                                        for chunk in response.iter_content(
-                                            chunk_size=65536
-                                        ):
-                                            stream.write(chunk)
-                                # Validate downloaded content before making it a reusable cache entry.
-                                clean_text(
-                                    part.read_text(encoding="utf-8-sig"),
-                                    require_wrappers=is_gutenberg,
-                                )
-                                part.replace(raw_path)
-                            finally:
-                                part.unlink(missing_ok=True)
-                                time.sleep(args.download_delay)
+                            fetch_source(
+                                session,
+                                source,
+                                args.mirror,
+                                raw_path,
+                                args.download_delay,
+                            )
                     else:
                         raw_path = Path(source)
                     raw = raw_path.read_text(encoding="utf-8-sig")
@@ -259,12 +383,45 @@ def prepare(args):
                         duplicates.append(source)
                         continue
                     hashes.add(digest)
+                    filter_counts["input_words"] += len(text.split())
+                    kept, pending_hashes = [], set()
+                    for paragraph in prose_paragraphs(text, args.min_paragraph_words):
+                        phash = hashlib.sha256(
+                            re.sub(r"\s+", " ", paragraph).casefold().encode()
+                        ).hexdigest()
+                        if phash in paragraph_hashes or phash in pending_hashes:
+                            filter_counts["duplicate_paragraphs"] += 1
+                            continue
+                        kept.append(paragraph)
+                        pending_hashes.add(phash)
+                    retained_words = sum(len(p.split()) for p in kept)
+                    if not kept or retained_words < args.min_document_words:
+                        exclusions.append(
+                            {
+                                "source": source,
+                                "title": entry["title"],
+                                "retained_words": retained_words,
+                                "reason": "Too little prose after filtering and deduplication",
+                            }
+                        )
+                        print(
+                            f"[{index}/{len(entries)}] Excluded {entry['title']}: only {retained_words:,} retained prose words",
+                            flush=True,
+                        )
+                        continue
+                    paragraph_hashes.update(pending_hashes)
+                    filter_counts["retained_words"] += retained_words
+                    text = "\n\n".join(kept) + "\n"
+                    title, group = document_identity(raw, entry["title"])
                     relative = f"clean/{digest}.txt"
                     (staging / relative).write_text(text, encoding="utf-8")
                     documents.append(
                         {
                             **entry,
-                            "sha256": digest,
+                            "title": title,
+                            "group": group,
+                            "raw_sha256": digest,
+                            "sha256": hashlib.sha256(text.encode()).hexdigest(),
                             "path": relative,
                             "characters": len(text),
                         }
@@ -285,7 +442,12 @@ def prepare(args):
                     )
             write_json(
                 cache / "last-prepare-report.json",
-                {"failures": failures, "duplicate_sources": duplicates},
+                {
+                    "failures": failures,
+                    "duplicate_sources": duplicates,
+                    "excluded_documents": exclusions,
+                    "filter_counts": filter_counts,
+                },
             )
             if failures and not args.skip_errors:
                 raise ValueError(
@@ -314,6 +476,11 @@ def prepare(args):
                 flush=True,
             )
             backend.train_from_iterator(training_text, trainer=trainer)
+            backend.post_processor = processors.TemplateProcessing(
+                single="<|bos|> $A",
+                pair="<|bos|> $A $B",
+                special_tokens=[("<|bos|>", backend.token_to_id("<|bos|>"))],
+            )
             tokenizer = PreTrainedTokenizerFast(
                 tokenizer_object=backend,
                 pad_token=SPECIAL_TOKENS[0],
@@ -321,38 +488,60 @@ def prepare(args):
                 eos_token=SPECIAL_TOKENS[2],
             )
             tokenizer.save_pretrained(staging / "tokenizer")
-            counts = {}
+            counts, passage_counts, target_counts = {}, {}, {}
             for split in ("train", "validation", "test"):
                 count = 0
+                offsets = [0]
                 with (staging / f"{split}.bin").open("wb") as stream:
                     for document in documents:
                         if document["split"] != split:
                             continue
                         before = count
-                        np.asarray([tokenizer.bos_token_id], dtype="<u2").tofile(stream)
-                        count += 1
-                        for chunk in text_chunks(staging / document["path"]):
-                            ids = backend.encode(chunk, add_special_tokens=False).ids
-                            np.asarray(ids, dtype="<u2").tofile(stream)
-                            count += len(ids)
-                        np.asarray([tokenizer.eos_token_id], dtype="<u2").tofile(stream)
-                        count += 1
+                        document["first_passage"] = len(offsets) - 1
+                        for paragraph in (
+                            (staging / document["path"])
+                            .read_text(encoding="utf-8")
+                            .split("\n\n")
+                        ):
+                            for ids in passage_tokens(
+                                paragraph,
+                                backend,
+                                args.context,
+                                tokenizer.bos_token_id,
+                                tokenizer.eos_token_id,
+                            ):
+                                np.asarray(ids, dtype="<u2").tofile(stream)
+                                count += len(ids)
+                                offsets.append(count)
                         document["tokens"] = count - before
+                        document["passages"] = (
+                            len(offsets) - 1 - document["first_passage"]
+                        )
                 counts[split] = count
+                passage_counts[split] = len(offsets) - 1
+                target_counts[split] = count - passage_counts[split]
+                np.save(
+                    staging / f"{split}.offsets.npy", np.asarray(offsets, dtype="<i8")
+                )
             fingerprint = hashlib.sha256(
                 (json.dumps(documents, sort_keys=True) + backend.to_str()).encode()
             ).hexdigest()
             metadata = {
-                "format_version": 1,
+                "format_version": 2,
+                "context": args.context,
                 "dtype": "<u2",
                 "seed": args.seed,
                 "vocab_size": len(tokenizer),
                 "token_counts": counts,
+                "passage_counts": passage_counts,
+                "target_counts": target_counts,
+                "filter_counts": filter_counts,
+                "excluded_documents": exclusions,
                 "fingerprint": fingerprint,
                 "documents": documents,
                 "failed_sources": failures,
                 "duplicate_sources": duplicates,
-                "split_unit": "whole book; exact duplicate books removed before splitting",
+                "split_unit": "work family; exact duplicate books and paragraphs removed before splitting",
             }
             write_json(staging / "metadata.json", metadata)
             # Publish only a complete dataset. Downloads remain reusable after failures.
@@ -366,6 +555,10 @@ def prepare(args):
                 "books": len(documents),
                 "vocab_size": len(tokenizer),
                 "tokens": counts,
+                "passages": passage_counts,
+                "target_tokens": target_counts,
+                "excluded_documents": len(exclusions),
+                "filter_counts": filter_counts,
             },
             indent=2,
         )
@@ -375,8 +568,8 @@ def prepare(args):
 class TokenBlocks:
     """Memory-mapped causal-LM sequences with each target counted once.
 
-    Adjacent blocks overlap by one context token. The final short block is
-    padded and its padding labels are masked. EOS/BOS delimit packed books.
+    Format 2 stores independent passages with BOS and sentence-aware EOS.
+    Padding labels are masked. Legacy flat streams remain readable for tests.
     """
 
     def __init__(self, data_dir, split, context, pad_token_id):
@@ -390,19 +583,43 @@ class TokenBlocks:
         if path.stat().st_size != metadata["token_counts"][split] * dtype.itemsize:
             raise ValueError(f"{path} does not match its recorded token count.")
         self.tokens = np.memmap(path, dtype=dtype, mode="r")
+        self.offsets = None
+        if metadata.get("format_version", 1) >= 2:
+            if context != metadata["context"]:
+                raise ValueError(
+                    "Training context must match the prepared passage context; prepare a new dataset."
+                )
+            self.offsets = np.load(
+                Path(data_dir) / f"{split}.offsets.npy", mmap_mode="r"
+            )
+            lengths = np.diff(self.offsets)
+            if (
+                self.offsets[0] != 0
+                or self.offsets[-1] != len(self.tokens)
+                or len(lengths) != metadata["passage_counts"][split]
+                or np.any(lengths < 2)
+                or np.any(lengths > context)
+            ):
+                raise ValueError("Invalid passage offsets or sequence lengths.")
         if context < 2 or len(self.tokens) < 2:
             raise ValueError(
                 "Context and token stream must each contain at least two tokens."
             )
 
     def __len__(self):
+        if self.offsets is not None:
+            return len(self.offsets) - 1
         return (len(self.tokens) - 2) // (self.context - 1) + 1
 
     def __getitem__(self, index):
         if not 0 <= index < len(self):
             raise IndexError(index)
-        start = index * (self.context - 1)
-        chunk = np.asarray(self.tokens[start : start + self.context], dtype=np.int64)
+        if self.offsets is None:
+            start = index * (self.context - 1)
+            end = start + self.context
+        else:
+            start, end = self.offsets[index : index + 2]
+        chunk = np.asarray(self.tokens[start:end], dtype=np.int64)
         size = len(chunk)
         inputs = self.torch.full((self.context,), self.pad, dtype=self.torch.long)
         inputs[:size] = self.torch.from_numpy(chunk.copy())

@@ -3,6 +3,7 @@
 """
 
 # Imports from the Python standard library.
+import bisect
 import hashlib
 import importlib
 import importlib.metadata
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -35,9 +37,9 @@ CONFIG = {
     "train": True,
     "evaluate": True,
     "interactive": True,
-    "data_dir": "data/one_piece/prepared",
+    "data_dir": "data/one_piece/coherent-prepared",
     "cache_dir": "data/one_piece/raw",
-    "output_dir": "runs/one_piece",
+    "output_dir": "runs/one_piece-coherent",
     "model_dir": None,  # None selects output_dir/best, then output_dir/model.
     "resume": None,  # None automatically finds a checkpoint in output_dir.
     "mirror": "https://mirror.cs.odu.edu/gutenberg-epub",
@@ -45,12 +47,18 @@ CONFIG = {
     "max_sources": 0,  # 0 means all embedded sources; a pilot needs >= 3.
     "skip_errors": False,
     "vocab_size": 8192,
+    "min_document_words": 2000,
+    "min_paragraph_words": 8,
     "validation_fraction": 0.05,
     "test_fraction": 0.05,
     "seed": 42,
     "device": "auto",  # auto, cuda, mps, or cpu.
     "threads": 4,
-    "max_steps": 10000,
+    "epochs": 3,  # Complete shuffled passes through the prepared passages.
+    "max_steps": None,  # Optional fixed-step override for a smoke test.
+    "early_stopping_patience": 8,
+    "early_stopping_min_delta": 0.005,
+    "precision": "auto",  # BF16 on supported CUDA GPUs; otherwise FP32.
     "batch_size": 8,
     "gradient_accumulation": 4,
     "context": 256,
@@ -62,7 +70,7 @@ CONFIG = {
     "weight_decay": 0.1,
     "warmup_steps": 200,
     "eval_every": 500,
-    "eval_batches": 20,  # Training validation; 0 evaluates the full split.
+    "eval_batches": 128,  # Fixed validation sample; 0 evaluates the full split.
     "save_every": 1000,
     "log_every": 25,
     "sample_max_new_tokens": 64,
@@ -73,9 +81,9 @@ CONFIG = {
         "In gardening, it is important to",
     ],
     "split": "test",
-    "max_batches": 20,  # Final evaluation; 0 evaluates the full held-out split.
+    "max_batches": 0,  # Final evaluation covers the full held-out split.
     "max_new_tokens": 64,  # Interactive and evaluation response length.
-    "temperature": 0.8,
+    "temperature": 0.7,  # Set 0 for greedy decoding.
     "report": None,  # None writes a test-results.json beside the chosen model.
 }
 
@@ -127,7 +135,6 @@ import numpy as np
 import requests
 import torch
 from requests.adapters import HTTPAdapter
-from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 from torch.utils.data import DataLoader, Subset
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizerFast
 from urllib3.util.retry import Retry
@@ -553,7 +560,208 @@ sources = [
   "https://www.gutenberg.org/cache/epub/22973/pg22973.txt", #The English Husbandman by Gervase Markham
   "https://www.gutenberg.org/cache/epub/69970/pg69970.txt", #The English Husbandman (The Second Booke) by Gervase Markham
 
+
+
 ]
+
+def prose_paragraphs(text, min_words=8):
+    """Conservative prose selection, including adjacent question/answer pairs.
+
+    This is a formatting filter, not a factual or semantic quality classifier.
+    All removed text remains available in the raw download cache.
+    """
+    paragraphs = re.split(r"\n\s*\n", text)
+    pending = []
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+        if re.match(r"^(?:Q\.|Q:|Question\b)", paragraph, re.IGNORECASE):
+            pending.append(paragraph)
+            continue
+        if pending:
+            paragraph = "\n".join(pending + [paragraph])
+            pending = []
+        if len(paragraph.split()) < min_words:
+            continue
+        if re.match(
+            r"^(?:\[?transcriber|produced by|etext prepared|credits:)",
+            paragraph,
+            re.IGNORECASE,
+        ):
+            continue
+        visible = sum(not ch.isspace() for ch in paragraph)
+        letters = sum(ch.isalpha() for ch in paragraph)
+        if not visible or letters / visible < 0.65:
+            continue
+        if not re.search(r"[.!?](?:\s|$|[\"”’\]])", paragraph):
+            continue
+        yield paragraph
+
+
+def document_identity(raw, fallback):
+    """Keep volumes/editions of the same titled work in one held-out split."""
+    header = raw[: raw.find("*** START") if "*** START" in raw else 2000]
+    title = re.search(r"^Title:\s*(.+)", header, re.MULTILINE)
+    author = re.search(r"^Author:\s*(.+)", header, re.MULTILINE)
+    title = title[1].strip() if title else fallback
+    family = re.sub(
+        r"\b(?:volumes?|vol\.?|parts?|books?)\s+[\divxlcdm]+\b.*",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    family = re.sub(r"\W+", " ", family.casefold()).strip()
+    return title, family + "|" + (author[1].casefold().strip() if author else "")
+
+
+def passage_tokens(text, backend, context, bos, eos):
+    """Prefer sentence boundaries; never combine paragraphs from different books.
+
+    A long sentence can require a hard cut. Such cuts do not receive an EOS
+    target: the model must not learn that arbitrary token limits end a thought.
+    """
+    encoding = backend.encode(text, add_special_tokens=False)
+    ids = encoding.ids
+    ends = [end for _, end in encoding.offsets]
+    boundaries = {
+        bisect.bisect_right(ends, m.end())
+        for m in re.finditer(r"[.!?][\"”’\])]*(?=\s|$)", text)
+    }
+    boundaries.add(len(ids))
+    start, limit = 0, context - 2
+    while start < len(ids):
+        cap = min(start + limit, len(ids))
+        candidates = [b for b in boundaries if start + max(1, limit // 4) <= b <= cap]
+        end = max(candidates) if candidates else cap
+        yield [bos] + ids[start:end] + ([eos] if end in boundaries else [])
+        start = end
+
+
+def fetch_source(session, source, mirror, destination, delay):
+    """Try the generated mirror, then its legacy text paths on a missing file."""
+    primary = download_url(source, mirror)
+    candidates = [primary]
+    match = re.search(r"/cache/epub/(\d+)/pg\d+\.txt$", urlparse(source).path)
+    if match and mirror.rstrip("/").endswith("/gutenberg-epub"):
+        book = match[1]
+        legacy = mirror.rstrip("/").rsplit("/", 1)[0] + "/gutenberg/"
+        legacy += "/".join(book[:-1]) + "/" + book + "/" + book
+        candidates.extend([legacy + "-0.txt", legacy + ".txt"])
+    part = destination.with_suffix(".part")
+    try:
+        for index, url in enumerate(candidates):
+            try:
+                with session.get(url, timeout=(10, 60), stream=True) as response:
+                    if response.status_code == 404 and index + 1 < len(candidates):
+                        continue
+                    response.raise_for_status()
+                    with part.open("wb") as stream:
+                        for chunk in response.iter_content(chunk_size=65536):
+                            stream.write(chunk)
+                clean_text(
+                    part.read_text(encoding="utf-8-sig"), require_wrappers=bool(match)
+                )
+                part.replace(destination)
+                if index:
+                    print(f"Using legacy Gutenberg text: {url}", flush=True)
+                return
+            finally:
+                time.sleep(delay)
+    finally:
+        part.unlink(missing_ok=True)
+
+
+def precision_context(device, precision):
+    return (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if precision == "bfloat16"
+        else nullcontext()
+    )
+
+
+def configure_training(args, metadata):
+    if metadata.get("format_version") != 2:
+        raise ValueError(
+            "Prepare a new passage dataset (format 2) before training this version."
+        )
+    if args.context != metadata["context"]:
+        raise ValueError("Training context must match the prepared passage context.")
+    if args.epochs < 1 or args.batch_size < 1 or args.gradient_accumulation < 1:
+        raise ValueError("Epochs and batch sizes must be positive.")
+    args.steps_per_epoch = math.ceil(
+        metadata["passage_counts"]["train"]
+        / (args.batch_size * args.gradient_accumulation)
+    )
+    if args.max_steps is None:
+        args.max_steps = args.epochs * args.steps_per_epoch
+    device = choose_device(args.device)
+    capable = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    if args.precision == "auto":
+        args.precision = "bfloat16" if capable else "float32"
+    if args.precision == "bfloat16" and not capable:
+        raise ValueError(
+            "BF16 training requires a supported CUDA GPU; use precision='float32'."
+        )
+    args.attention_implementation = "sdpa" if device.type == "cuda" else "eager"
+
+
+class ShuffledEpochSampler:
+    """Visit each passage once per epoch; save the permutation and cursor."""
+
+    def __init__(self, size, seed, lengths=None, batch_size=1):
+        self.size, self.epoch, self.cursor = size, 0, 0
+        self.generator = torch.Generator().manual_seed(seed)
+        self.lengths = None if lengths is None else torch.as_tensor(lengths.copy())
+        self.batch_size = batch_size
+        self.order = self.make_order()
+
+    def make_order(self):
+        order = torch.randperm(self.size, generator=self.generator)
+        if self.lengths is None:
+            return order
+        # Sort small shuffled pools by length, then shuffle full batch groups.
+        # Every passage is still visited exactly once. Similar lengths reduce
+        # padding, without a corpus-wide shortest-to-longest curriculum.
+        batches, tail = [], []
+        for pool in order.split(self.batch_size * 128):
+            pool = pool[torch.argsort(self.lengths[pool], stable=True)]
+            for batch in pool.split(self.batch_size):
+                (batches if len(batch) == self.batch_size else tail).append(batch)
+        permutation = torch.randperm(len(batches), generator=self.generator).tolist()
+        return torch.cat([batches[i] for i in permutation] + tail)
+
+    @property
+    def progress(self):
+        return self.epoch + self.cursor / self.size
+
+    def take(self, count):
+        if self.cursor == self.size:
+            self.epoch += 1
+            self.cursor = 0
+            self.order = self.make_order()
+        stop = min(self.cursor + count, self.size)
+        indices = self.order[self.cursor : stop].tolist()
+        self.cursor = stop
+        return indices
+
+    def state_dict(self):
+        return {
+            "size": self.size,
+            "epoch": self.epoch,
+            "cursor": self.cursor,
+            "order": self.order.clone(),
+            "rng": self.generator.get_state(),
+        }
+
+    def load_state_dict(self, state):
+        if state["size"] != self.size:
+            raise ValueError("Checkpoint sampler has a different number of passages.")
+        self.epoch, self.cursor, self.order = (
+            state["epoch"],
+            state["cursor"],
+            state["order"],
+        )
+        self.generator.set_state(state["rng"])
+
 
 # Parsing and corpus preparation.
 SPECIAL_TOKENS = ["<|pad|>", "<|bos|>", "<|endoftext|>"]
@@ -601,7 +809,10 @@ def preparation_signature(args):
     if args.max_sources:
         entries = entries[: args.max_sources]
     payload = {
-        "cleaner_version": 1,
+        "cleaner_version": 2,
+        "context": args.context,
+        "min_document_words": args.min_document_words,
+        "min_paragraph_words": args.min_paragraph_words,
         "sources": [entry["source"] for entry in entries],
         "vocab_size": args.vocab_size,
         "validation_fraction": args.validation_fraction,
@@ -663,21 +874,35 @@ def split_documents(documents, validation_fraction, test_fraction, seed):
         raise ValueError(
             "At least three distinct books are needed for train/validation/test splits."
         )
-    shuffled = list(documents)
-    random.Random(seed).shuffle(shuffled)
-    n_validation = max(1, round(len(shuffled) * validation_fraction))
-    n_test = max(1, round(len(shuffled) * test_fraction))
-    if n_validation + n_test >= len(shuffled):
-        raise ValueError("Split fractions leave no training books.")
-    for index, document in enumerate(shuffled):
-        document["split"] = (
-            "validation"
-            if index < n_validation
-            else "test"
-            if index < n_validation + n_test
-            else "train"
+    groups = {}
+    for document in documents:
+        groups.setdefault(document.get("group", document["sha256"]), []).append(
+            document
         )
-    return shuffled
+    grouped = list(groups.values())
+    if len(grouped) < 3:
+        raise ValueError(
+            "At least three independent work families are needed for held-out splits."
+        )
+    random.Random(seed).shuffle(grouped)
+    result = []
+    for split, fraction in (
+        ("validation", validation_fraction),
+        ("test", test_fraction),
+    ):
+        target, count = max(1, round(len(documents) * fraction)), 0
+        reserved = 2 if split == "validation" else 1
+        while count < target and len(grouped) > reserved:
+            group = grouped.pop(0)
+            for document in group:
+                document["split"] = split
+            result.extend(group)
+            count += len(group)
+    for group in grouped:
+        for document in group:
+            document["split"] = "train"
+        result.extend(group)
+    return result
 
 
 def text_chunks(path, size=16384):
@@ -688,7 +913,20 @@ def text_chunks(path, size=16384):
 
 
 def prepare(args):
+    from tokenizers import (
+        Tokenizer,
+        decoders,
+        models,
+        pre_tokenizers,
+        processors,
+        trainers,
+    )
+    from transformers import PreTrainedTokenizerFast
 
+    if args.context < 16 or args.min_document_words < 0 or args.min_paragraph_words < 1:
+        raise ValueError(
+            "Context must be >=16 and text-filter thresholds must be nonnegative."
+        )
     if not 259 <= args.vocab_size <= 65535:
         raise ValueError(
             "vocab-size must be between 259 and 65535 for byte BPE and uint16 storage."
@@ -706,7 +944,7 @@ def prepare(args):
     output, cache = Path(args.data_dir), Path(args.cache_dir)
     if output.exists():
         raise ValueError(
-            f"{output} already exists. Use a new CONFIG['data_dir'] to preserve existing splits."
+            f"{output} already exists. Use a new --data-dir to preserve existing splits."
         )
     entries = load_sources(args.sources)
     if args.max_sources:
@@ -730,6 +968,12 @@ def prepare(args):
             staging = Path(temporary)
             (staging / "clean").mkdir()
             documents, failures, duplicates, hashes = [], [], [], set()
+            paragraph_hashes, exclusions = set(), []
+            filter_counts = {
+                "input_words": 0,
+                "retained_words": 0,
+                "duplicate_paragraphs": 0,
+            }
             for index, entry in enumerate(entries, 1):
                 source = entry["source"]
                 try:
@@ -739,49 +983,65 @@ def prepare(args):
                         "www.gutenberg.org",
                     }
                     if is_remote:
-                        url = download_url(source, args.mirror)
                         raw_path = cache / (
                             hashlib.sha256(source.encode()).hexdigest() + ".txt"
                         )
                         if not raw_path.exists():
-                            part = raw_path.with_suffix(".part")
-                            try:
-                                with session.get(
-                                    url, timeout=(10, 60), stream=True
-                                ) as response:
-                                    response.raise_for_status()
-                                    with part.open("wb") as stream:
-                                        for chunk in response.iter_content(
-                                            chunk_size=65536
-                                        ):
-                                            stream.write(chunk)
-                                # Validate downloaded content before making it a reusable cache entry.
-                                clean_text(
-                                    part.read_text(encoding="utf-8-sig"),
-                                    require_wrappers=is_gutenberg,
-                                )
-                                part.replace(raw_path)
-                            finally:
-                                part.unlink(missing_ok=True)
-                                time.sleep(args.download_delay)
+                            fetch_source(
+                                session,
+                                source,
+                                args.mirror,
+                                raw_path,
+                                args.download_delay,
+                            )
                     else:
                         raw_path = Path(source)
                     raw = raw_path.read_text(encoding="utf-8-sig")
-                    title = re.search(r"^Title:[ \t]*(.+)$", raw[:20000], re.MULTILINE)
-                    if title:
-                        entry["title"] = title.group(1).strip()
                     text = clean_text(raw, require_wrappers=is_remote and is_gutenberg)
                     digest = hashlib.sha256(text.encode()).hexdigest()
                     if digest in hashes:
                         duplicates.append(source)
                         continue
                     hashes.add(digest)
+                    filter_counts["input_words"] += len(text.split())
+                    kept, pending_hashes = [], set()
+                    for paragraph in prose_paragraphs(text, args.min_paragraph_words):
+                        phash = hashlib.sha256(
+                            re.sub(r"\s+", " ", paragraph).casefold().encode()
+                        ).hexdigest()
+                        if phash in paragraph_hashes or phash in pending_hashes:
+                            filter_counts["duplicate_paragraphs"] += 1
+                            continue
+                        kept.append(paragraph)
+                        pending_hashes.add(phash)
+                    retained_words = sum(len(p.split()) for p in kept)
+                    if not kept or retained_words < args.min_document_words:
+                        exclusions.append(
+                            {
+                                "source": source,
+                                "title": entry["title"],
+                                "retained_words": retained_words,
+                                "reason": "Too little prose after filtering and deduplication",
+                            }
+                        )
+                        print(
+                            f"[{index}/{len(entries)}] Excluded {entry['title']}: only {retained_words:,} retained prose words",
+                            flush=True,
+                        )
+                        continue
+                    paragraph_hashes.update(pending_hashes)
+                    filter_counts["retained_words"] += retained_words
+                    text = "\n\n".join(kept) + "\n"
+                    title, group = document_identity(raw, entry["title"])
                     relative = f"clean/{digest}.txt"
                     (staging / relative).write_text(text, encoding="utf-8")
                     documents.append(
                         {
                             **entry,
-                            "sha256": digest,
+                            "title": title,
+                            "group": group,
+                            "raw_sha256": digest,
+                            "sha256": hashlib.sha256(text.encode()).hexdigest(),
                             "path": relative,
                             "characters": len(text),
                         }
@@ -802,11 +1062,16 @@ def prepare(args):
                     )
             write_json(
                 cache / "last-prepare-report.json",
-                {"failures": failures, "duplicate_sources": duplicates},
+                {
+                    "failures": failures,
+                    "duplicate_sources": duplicates,
+                    "excluded_documents": exclusions,
+                    "filter_counts": filter_counts,
+                },
             )
             if failures and not args.skip_errors:
                 raise ValueError(
-                    f"{len(failures)} sources failed; see {cache / 'last-prepare-report.json'}. Fix them or set CONFIG['skip_errors'] = True."
+                    f"{len(failures)} sources failed; see {cache / 'last-prepare-report.json'}. Fix them or explicitly use --skip-errors."
                 )
             documents = split_documents(
                 documents, args.validation_fraction, args.test_fraction, args.seed
@@ -831,6 +1096,11 @@ def prepare(args):
                 flush=True,
             )
             backend.train_from_iterator(training_text, trainer=trainer)
+            backend.post_processor = processors.TemplateProcessing(
+                single="<|bos|> $A",
+                pair="<|bos|> $A $B",
+                special_tokens=[("<|bos|>", backend.token_to_id("<|bos|>"))],
+            )
             tokenizer = PreTrainedTokenizerFast(
                 tokenizer_object=backend,
                 pad_token=SPECIAL_TOKENS[0],
@@ -838,40 +1108,62 @@ def prepare(args):
                 eos_token=SPECIAL_TOKENS[2],
             )
             tokenizer.save_pretrained(staging / "tokenizer")
-            counts = {}
+            counts, passage_counts, target_counts = {}, {}, {}
             for split in ("train", "validation", "test"):
                 count = 0
+                offsets = [0]
                 with (staging / f"{split}.bin").open("wb") as stream:
                     for document in documents:
                         if document["split"] != split:
                             continue
                         before = count
-                        np.asarray([tokenizer.bos_token_id], dtype="<u2").tofile(stream)
-                        count += 1
-                        for chunk in text_chunks(staging / document["path"]):
-                            ids = backend.encode(chunk, add_special_tokens=False).ids
-                            np.asarray(ids, dtype="<u2").tofile(stream)
-                            count += len(ids)
-                        np.asarray([tokenizer.eos_token_id], dtype="<u2").tofile(stream)
-                        count += 1
+                        document["first_passage"] = len(offsets) - 1
+                        for paragraph in (
+                            (staging / document["path"])
+                            .read_text(encoding="utf-8")
+                            .split("\n\n")
+                        ):
+                            for ids in passage_tokens(
+                                paragraph,
+                                backend,
+                                args.context,
+                                tokenizer.bos_token_id,
+                                tokenizer.eos_token_id,
+                            ):
+                                np.asarray(ids, dtype="<u2").tofile(stream)
+                                count += len(ids)
+                                offsets.append(count)
                         document["tokens"] = count - before
+                        document["passages"] = (
+                            len(offsets) - 1 - document["first_passage"]
+                        )
                 counts[split] = count
+                passage_counts[split] = len(offsets) - 1
+                target_counts[split] = count - passage_counts[split]
+                np.save(
+                    staging / f"{split}.offsets.npy", np.asarray(offsets, dtype="<i8")
+                )
             fingerprint = hashlib.sha256(
                 (json.dumps(documents, sort_keys=True) + backend.to_str()).encode()
             ).hexdigest()
             metadata = {
-                "format_version": 1,
-                "preparation_signature": preparation_signature(args),
+                "format_version": 2,
+                "context": args.context,
                 "dtype": "<u2",
                 "seed": args.seed,
                 "vocab_size": len(tokenizer),
                 "token_counts": counts,
+                "passage_counts": passage_counts,
+                "target_counts": target_counts,
+                "filter_counts": filter_counts,
+                "excluded_documents": exclusions,
                 "fingerprint": fingerprint,
                 "documents": documents,
                 "failed_sources": failures,
                 "duplicate_sources": duplicates,
-                "split_unit": "whole book; exact duplicate books removed before splitting",
+                "split_unit": "work family; exact duplicate books and paragraphs removed before splitting",
             }
+            metadata["preparation_signature"] = preparation_signature(args)
             write_json(staging / "metadata.json", metadata)
             # Publish only a complete dataset. Downloads remain reusable after failures.
             shutil.move(str(staging), str(output))
@@ -884,6 +1176,10 @@ def prepare(args):
                 "books": len(documents),
                 "vocab_size": len(tokenizer),
                 "tokens": counts,
+                "passages": passage_counts,
+                "target_tokens": target_counts,
+                "excluded_documents": len(exclusions),
+                "filter_counts": filter_counts,
             },
             indent=2,
         )
@@ -893,11 +1189,13 @@ def prepare(args):
 class TokenBlocks:
     """Memory-mapped causal-LM sequences with each target counted once.
 
-    Adjacent blocks overlap by one context token. The final short block is
-    padded and its padding labels are masked. EOS/BOS delimit packed books.
+    Format 2 stores independent passages with BOS and sentence-aware EOS.
+    Padding labels are masked. Legacy flat streams remain readable for tests.
     """
 
     def __init__(self, data_dir, split, context, pad_token_id):
+        import torch
+
         self.torch = torch
         self.context, self.pad = context, pad_token_id
         metadata = json.loads((Path(data_dir) / "metadata.json").read_text())
@@ -906,19 +1204,43 @@ class TokenBlocks:
         if path.stat().st_size != metadata["token_counts"][split] * dtype.itemsize:
             raise ValueError(f"{path} does not match its recorded token count.")
         self.tokens = np.memmap(path, dtype=dtype, mode="r")
+        self.offsets = None
+        if metadata.get("format_version", 1) >= 2:
+            if context != metadata["context"]:
+                raise ValueError(
+                    "Training context must match the prepared passage context; prepare a new dataset."
+                )
+            self.offsets = np.load(
+                Path(data_dir) / f"{split}.offsets.npy", mmap_mode="r"
+            )
+            lengths = np.diff(self.offsets)
+            if (
+                self.offsets[0] != 0
+                or self.offsets[-1] != len(self.tokens)
+                or len(lengths) != metadata["passage_counts"][split]
+                or np.any(lengths < 2)
+                or np.any(lengths > context)
+            ):
+                raise ValueError("Invalid passage offsets or sequence lengths.")
         if context < 2 or len(self.tokens) < 2:
             raise ValueError(
                 "Context and token stream must each contain at least two tokens."
             )
 
     def __len__(self):
+        if self.offsets is not None:
+            return len(self.offsets) - 1
         return (len(self.tokens) - 2) // (self.context - 1) + 1
 
     def __getitem__(self, index):
         if not 0 <= index < len(self):
             raise IndexError(index)
-        start = index * (self.context - 1)
-        chunk = np.asarray(self.tokens[start : start + self.context], dtype=np.int64)
+        if self.offsets is None:
+            start = index * (self.context - 1)
+            end = start + self.context
+        else:
+            start, end = self.offsets[index : index + 2]
+        chunk = np.asarray(self.tokens[start:end], dtype=np.int64)
         size = len(chunk)
         inputs = self.torch.full((self.context,), self.pad, dtype=self.torch.long)
         inputs[:size] = self.torch.from_numpy(chunk.copy())
@@ -932,19 +1254,29 @@ class TokenBlocks:
 # Model training, checkpointing, and evaluation.
 def training_configuration(args):
     return {
-        "context": args.context,
-        "width": args.width,
-        "layers": args.layers,
-        "heads": args.heads,
-        "dropout": args.dropout,
-        "batch_size": args.batch_size,
-        "gradient_accumulation": args.gradient_accumulation,
-        "max_steps": args.max_steps,
-        "learning_rate": args.learning_rate,
-        "weight_decay": args.weight_decay,
-        "warmup_steps": args.warmup_steps,
-        "seed": args.seed,
-    }
+        name: getattr(args, name)
+        for name in (
+            "context",
+            "width",
+            "layers",
+            "heads",
+            "dropout",
+            "batch_size",
+            "gradient_accumulation",
+            "max_steps",
+            "epochs",
+            "learning_rate",
+            "weight_decay",
+            "warmup_steps",
+            "seed",
+            "precision",
+            "attention_implementation",
+            "eval_every",
+            "eval_batches",
+            "early_stopping_patience",
+            "early_stopping_min_delta",
+        )
+    } | {"training_version": 2}
 
 
 SAMPLE_EVERY = 100
@@ -1000,11 +1332,11 @@ def read_prompts(prompts):
 
 
 def sample_responses(
-    model, tokenizer, prompts, device, max_new_tokens=64, temperature=0.8, seed=42
+    model, tokenizer, prompts, device, max_new_tokens=64, temperature=0.7, seed=42
 ):
     """Generate without consuming training RNG state or leaving dropout disabled."""
-    if max_new_tokens < 1 or temperature <= 0:
-        raise ValueError("max-new-tokens and temperature must be positive.")
+    if max_new_tokens < 1 or temperature < 0:
+        raise ValueError("max-new-tokens must be positive and temperature nonnegative.")
     previous_mode, previous_rng = model.training, rng_state(device)
     samples = []
     try:
@@ -1013,20 +1345,32 @@ def sample_responses(
         budget = min(max_new_tokens, model.config.n_positions - 1)
         with torch.inference_mode():
             for prompt in prompts:
-                ids = tokenizer.encode(prompt, add_special_tokens=False)
-                ids = (ids or [tokenizer.bos_token_id])[
-                    -(model.config.n_positions - budget) :
-                ]
+                # New passage tokenizers prepend BOS automatically. Preserve
+                # it when truncating, while supporting older saved tokenizers.
+                ids = tokenizer.encode(prompt) or [tokenizer.bos_token_id]
+                room = model.config.n_positions - budget
+                if len(ids) > room:
+                    if ids[0] == tokenizer.bos_token_id:
+                        ids = ids[:1] + (ids[-(room - 1) :] if room > 1 else [])
+                    else:
+                        ids = ids[-room:]
                 input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+                sampling = (
+                    {
+                        "temperature": temperature,
+                        "top_p": 0.9,
+                        "top_k": min(50, len(tokenizer)),
+                    }
+                    if temperature
+                    else {}
+                )
                 output = model.generate(
                     input_ids=input_ids,
                     attention_mask=torch.ones_like(input_ids),
                     max_new_tokens=budget,
-                    do_sample=True,
-                    temperature=temperature,
-                    top_p=0.9,
-                    top_k=min(50, len(tokenizer)),
-                    repetition_penalty=1.1,
+                    do_sample=bool(temperature),
+                    **sampling,
+                    repetition_penalty=1.05 if temperature else 1.0,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                     bad_words_ids=[[tokenizer.pad_token_id], [tokenizer.bos_token_id]],
@@ -1057,7 +1401,7 @@ def append_json(path, value):
         stream.write(json.dumps(value, ensure_ascii=False) + "\n")
 
 
-def evaluate(model, dataset, device, batch_size, max_batches=0):
+def evaluate(model, dataset, device, batch_size, max_batches=0, precision="float32"):
     """Token-weighted loss; padding and the first context token are not targets."""
     previous_mode = model.training
     total_loss, total_targets, batches = 0.0, 0, 0
@@ -1081,7 +1425,8 @@ def evaluate(model, dataset, device, batch_size, max_batches=0):
             for batch in loader:
                 batch = {key: value.to(device) for key, value in batch.items()}
                 targets = int((batch["labels"][:, 1:] != -100).sum().item())
-                loss = model(**batch, use_cache=False).loss.item()
+                with precision_context(device, precision):
+                    loss = model(**batch, use_cache=False).loss.item()
                 if not math.isfinite(loss):
                     raise ValueError("Non-finite evaluation loss.")
                 total_loss += loss * targets
@@ -1123,12 +1468,23 @@ def build_model(tokenizer, args):
         pad_token_id=tokenizer.pad_token_id,
     )
     # This constructor initializes random weights. No pretrained GPT-2 weights.
-    config._attn_implementation = "eager"
+    config._attn_implementation = getattr(args, "attention_implementation", "eager")
     return GPT2LMHeadModel(config)
 
 
 def save_checkpoint(
-    path, model, tokenizer, optimizer, scheduler, sampler, step, best_loss, run, device
+    path,
+    model,
+    tokenizer,
+    optimizer,
+    scheduler,
+    sampler,
+    step,
+    best_loss,
+    run,
+    device,
+    progress=None,
+    completed=False,
 ):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -1142,8 +1498,10 @@ def save_checkpoint(
             "best_validation_loss": best_loss,
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
-            "sampler_rng": sampler.get_state(),
+            "sampler": sampler.state_dict(),
             "rng": rng_state(device),
+            "progress": dict(progress or {}),
+            "completed": completed,
         },
         temporary,
     )
@@ -1151,6 +1509,9 @@ def save_checkpoint(
 
 
 def train(args):
+    output, data = Path(args.output_dir), Path(args.data_dir)
+    metadata = json.loads((data / "metadata.json").read_text())
+    configure_training(args, metadata)
     if (
         min(
             args.max_steps,
@@ -1180,11 +1541,11 @@ def train(args):
         )
     if args.learning_rate <= 0 or args.weight_decay < 0:
         raise ValueError("Learning rate must be positive and weight decay nonnegative.")
+    if args.early_stopping_patience < 0 or args.early_stopping_min_delta < 0:
+        raise ValueError("Early-stopping settings must be nonnegative.")
     if args.sample_max_new_tokens < 1:
         raise ValueError("sample-max-new-tokens must be positive.")
     prompts = read_prompts(args.sample_prompts)
-    output, data = Path(args.output_dir), Path(args.data_dir)
-    metadata = json.loads((data / "metadata.json").read_text())
     tokenizer = PreTrainedTokenizerFast.from_pretrained(
         data / "tokenizer", local_files_only=True
     )
@@ -1200,6 +1561,9 @@ def train(args):
         "sample_prompts": prompts,
         "sample_max_new_tokens": args.sample_max_new_tokens,
         "torch_version": str(torch.__version__),
+        "steps_per_epoch": args.steps_per_epoch,
+        "training_passages": metadata["passage_counts"]["train"],
+        "training_target_tokens": metadata["target_counts"]["train"],
     }
     state = None
     if args.resume:
@@ -1212,7 +1576,9 @@ def train(args):
                 "Resume requires the original training settings, including the planned max-steps."
             )
         model = GPT2LMHeadModel.from_pretrained(
-            checkpoint, local_files_only=True, attn_implementation="eager"
+            checkpoint,
+            local_files_only=True,
+            attn_implementation=args.attention_implementation,
         )
         state = torch.load(
             checkpoint / "training_state.pt", map_location="cpu", weights_only=True
@@ -1220,7 +1586,7 @@ def train(args):
     else:
         if output.exists() and any(output.iterdir()):
             raise ValueError(
-                f"{output} is not empty. Use a new output directory or CONFIG['resume']."
+                f"{output} is not empty. Use a new output directory or --resume."
             )
         model = build_model(tokenizer, args)
     if output.exists() and any(output.iterdir()):
@@ -1244,7 +1610,7 @@ def train(args):
         },
         {"params": [p for p in model.parameters() if p.ndim < 2], "weight_decay": 0.0},
     ]
-    optimizer = torch.optim.AdamW(groups, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(groups, lr=args.learning_rate, betas=(0.9, 0.95))
     warmup = min(args.warmup_steps, max(0, args.max_steps - 1))
 
     def learning_rate_factor(step):
@@ -1254,19 +1620,30 @@ def train(args):
         return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_factor)
-    sampler = torch.Generator().manual_seed(args.seed + 1)
+    sampler = ShuffledEpochSampler(
+        len(training),
+        args.seed + 1,
+        np.diff(training.offsets),
+        args.batch_size * args.gradient_accumulation,
+    )
+    progress = {
+        "target_tokens_seen": 0,
+        "bad_evaluations": 0,
+        "patience_reference_loss": float("inf"),
+    }
     start, best_loss = 0, float("inf")
     if state:
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
-        sampler.set_state(state["sampler_rng"])
+        sampler.load_state_dict(state["sampler"])
+        progress.update(state["progress"])
         restore_rng(state["rng"], device)
         start, best_loss = state["step"], state["best_validation_loss"]
         # A resumed run in a new directory needs its own best checkpoint.
         # The previous best model may belong to an earlier, unavailable step.
         if not (output / "best" / "training_state.pt").exists():
             best_loss = float("inf")
-    if start >= args.max_steps:
+    if start >= args.max_steps or (state and state.get("completed")):
         raise ValueError("This checkpoint already reached the planned max-steps.")
     print(
         f"Training {run['parameters']:,} randomly initialized parameters on {device}; samples every {SAMPLE_EVERY} optimizer steps.",
@@ -1276,36 +1653,50 @@ def train(args):
         f"Train tokens: {len(training.tokens):,}; validation tokens: {len(validation.tokens):,}",
         flush=True,
     )
+    print(
+        f"Planned updates: {args.max_steps:,}; {args.steps_per_epoch:,} per complete shuffled epoch; precision={args.precision}.",
+        flush=True,
+    )
+    stopped_early = False
     model.train()
     for step in range(start + 1, args.max_steps + 1):
         optimizer.zero_grad(set_to_none=True)
         microbatches = []
-        for _ in range(args.gradient_accumulation):
-            indices = torch.randint(
-                len(training), (args.batch_size,), generator=sampler
-            ).tolist()
+        update_indices = sampler.take(args.batch_size * args.gradient_accumulation)
+        for offset in range(0, len(update_indices), args.batch_size):
+            indices = update_indices[offset : offset + args.batch_size]
             rows = [training[index] for index in indices]
             batch = {key: torch.stack([row[key] for row in rows]) for key in rows[0]}
+            # Right-padding only to this microbatch's longest passage saves work.
+            length = int(batch["attention_mask"].sum(dim=1).max())
+            batch = {key: value[:, :length] for key, value in batch.items()}
             targets = int((batch["labels"][:, 1:] != -100).sum().item())
             microbatches.append((batch, targets))
         total_targets = sum(targets for _, targets in microbatches)
         train_loss = 0.0
         for batch, targets in microbatches:
             batch = {key: value.to(device) for key, value in batch.items()}
-            loss = model(**batch, use_cache=False).loss
+            with precision_context(device, args.precision):
+                loss = model(**batch, use_cache=False).loss
             if not torch.isfinite(loss):
                 raise ValueError(f"Non-finite training loss at step {step}.")
             weight = targets / total_targets
             (loss * weight).backward()
             train_loss += loss.detach().item() * weight
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), 1.0, error_if_nonfinite=True
+        )
         optimizer.step()
         scheduler.step()
+        progress["target_tokens_seen"] += total_targets
         if step == 1 or step % args.log_every == 0 or step == args.max_steps:
             metrics = {
                 "step": step,
                 "train_loss": train_loss,
                 "learning_rate": scheduler.get_last_lr()[0],
+                "epochs_completed": sampler.progress,
+                "target_tokens_seen": progress["target_tokens_seen"],
+                "gradient_norm": float(grad_norm),
             }
             print(json.dumps(metrics), flush=True)
             append_json(output / "metrics.jsonl", metrics)
@@ -1319,13 +1710,45 @@ def train(args):
                 seed=args.seed,
             )
             show_samples(samples, step)
-            append_json(output / "samples.jsonl", {"step": step, "samples": samples})
+            greedy = sample_responses(
+                model,
+                tokenizer,
+                prompts,
+                device,
+                args.sample_max_new_tokens,
+                temperature=0,
+                seed=args.seed,
+            )
+            print("Greedy comparison (no sampling):", flush=True)
+            show_samples(greedy, step)
+            append_json(
+                output / "samples.jsonl",
+                {
+                    "step": step,
+                    "epochs_completed": sampler.progress,
+                    "samples": samples,
+                    "greedy_samples": greedy,
+                },
+            )
         if step % args.eval_every == 0 or step == args.max_steps:
             metrics = evaluate(
-                model, validation, device, args.batch_size, args.eval_batches
+                model,
+                validation,
+                device,
+                args.batch_size,
+                args.eval_batches,
+                args.precision,
             )
             print(f"Validation at step {step}: {json.dumps(metrics)}", flush=True)
             append_json(output / "metrics.jsonl", {"step": step, "validation": metrics})
+            if (
+                metrics["loss"]
+                < progress["patience_reference_loss"] - args.early_stopping_min_delta
+            ):
+                progress["patience_reference_loss"] = metrics["loss"]
+                progress["bad_evaluations"] = 0
+            else:
+                progress["bad_evaluations"] += 1
             if metrics["loss"] < best_loss:
                 best_loss = metrics["loss"]
                 save_checkpoint(
@@ -1339,7 +1762,19 @@ def train(args):
                     best_loss,
                     run,
                     device,
+                    progress,
                 )
+            if (
+                args.early_stopping_patience
+                and sampler.progress >= 1
+                and progress["bad_evaluations"] >= args.early_stopping_patience
+            ):
+                stopped_early = True
+                print(
+                    "Stopping: validation loss has stopped improving meaningfully.",
+                    flush=True,
+                )
+                break
         if step % args.save_every == 0:
             save_checkpoint(
                 output / f"checkpoint-{step}",
@@ -1352,6 +1787,7 @@ def train(args):
                 best_loss,
                 run,
                 device,
+                progress,
             )
     save_checkpoint(
         output / "model",
@@ -1364,6 +1800,20 @@ def train(args):
         best_loss,
         run,
         device,
+        progress,
+        completed=True,
+    )
+    write_json(
+        output / "training_summary.json",
+        {
+            "steps": step,
+            "planned_steps": args.max_steps,
+            "epochs_completed": sampler.progress,
+            "target_tokens_seen": progress["target_tokens_seen"],
+            "best_validation_loss": best_loss,
+            "stopped_early": stopped_early,
+            "note": "Validation loss and sample comparisons are diagnostics, not a guarantee of coherence or factual accuracy.",
+        },
     )
     print(
         f"Saved final model to {output / 'model'}; best validation checkpoint to {output / 'best'}.",
@@ -1430,8 +1880,8 @@ def interactive_test(args, input_fn=None):
     """Let the user enter prompts repeatedly; also works with notebook input()."""
     if args.threads < 1:
         raise ValueError("threads must be positive.")
-    if args.max_new_tokens < 1 or args.temperature <= 0:
-        raise ValueError("max_new_tokens and temperature must be positive.")
+    if args.max_new_tokens < 1 or args.temperature < 0:
+        raise ValueError("max_new_tokens must be positive and temperature nonnegative.")
     input_fn = input if input_fn is None else input_fn
     torch.set_num_threads(args.threads)
     device = choose_device(args.device)
@@ -1508,6 +1958,7 @@ def run(config=None, source_list=None, input_fn=None):
             prepare(args)
     if args.train:
         metadata = json.loads((data / "metadata.json").read_text())
+        configure_training(args, metadata)
         finished = output / "model"
         completed = False
         if not args.resume and (finished / "training_state.pt").is_file():
@@ -1515,7 +1966,7 @@ def run(config=None, source_list=None, input_fn=None):
             state = torch.load(
                 finished / "training_state.pt", map_location="cpu", weights_only=True
             )
-            completed = state["step"] >= args.max_steps
+            completed = state.get("completed", False) or state["step"] >= args.max_steps
             if completed:
                 print(
                     f"Reusing completed training run at {finished} (step {state['step']}).",
@@ -1543,7 +1994,7 @@ def run(config=None, source_list=None, input_fn=None):
                     map_location="cpu",
                     weights_only=True,
                 )
-                completed = state["step"] >= args.max_steps
+                completed = state.get("completed", False) or state["step"] >= args.max_steps
                 del state
                 if completed:
                     fallback_model = Path(args.resume)

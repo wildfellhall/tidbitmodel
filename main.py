@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Provisional tidbitmodel pipeline (Python 3.10+).
+"""Passage-based tidbitmodel pipeline (Python 3.10+).
 
     python -m pip install -r requirements.txt
     python main.py prepare
     python main.py train
-    python main.py test --model-dir runs/tidbit/best
-    python main.py generate --model-dir runs/tidbit/best --prompt "A telescope is"
+    python main.py test --model-dir runs/tidbit-coherent/best
+    python main.py generate --model-dir runs/tidbit-coherent/best --prompt "A telescope is"
     python -m unittest discover -s tests -v
 
 Use each subcommand's --help for settings. Preparation reads corpus.py without
 executing it, downloads Gutenberg texts through a bulk mirror, splits whole
-books, and trains a fresh tokenizer. The default model has about 10.1M total
+work families, filters/deduplicates prose, and trains a fresh tokenizer.
+Three shuffled epochs are the default, with validation-based early stopping.
+The default model has about 10.1M total
 parameters at an 8,192-token vocabulary: 6 layers, width 320, 5 heads, and a
 256-token context. All weights are initialized from scratch.
 
@@ -48,7 +50,7 @@ def parser():
     prepare.add_argument(
         "--data-dir",
         type=Path,
-        default=Path("data/prepared"),
+        default=Path("data/coherent/prepared"),
         help="New directory for the prepared corpus.",
     )
     prepare.add_argument(
@@ -100,6 +102,24 @@ def parser():
     prepare.add_argument(
         "--seed", type=int, default=42, help="Seed for reproducible book splits."
     )
+    prepare.add_argument(
+        "--context",
+        type=int,
+        default=256,
+        help="Maximum tokens per prose passage, including BOS/EOS.",
+    )
+    prepare.add_argument(
+        "--min-document-words",
+        type=int,
+        default=2000,
+        help="Exclude fragments with fewer retained words; use 0 for tiny tests.",
+    )
+    prepare.add_argument(
+        "--min-paragraph-words",
+        type=int,
+        default=8,
+        help="Minimum prose paragraph length; adjacent Q&A is joined first.",
+    )
 
     train = commands.add_parser(
         "train",
@@ -109,20 +129,44 @@ def parser():
     train.add_argument(
         "--data-dir",
         type=Path,
-        default=Path("data/prepared"),
+        default=Path("data/coherent/prepared"),
         help="Prepared corpus directory.",
     )
     train.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("runs/tidbit"),
+        default=Path("runs/tidbit-coherent"),
         help="Run directory for metrics, samples, and checkpoints.",
     )
     train.add_argument(
         "--max-steps",
         type=int,
-        default=10000,
-        help="Total optimizer updates, including any already completed on resume.",
+        default=None,
+        help="Optional fixed-step budget overriding --epochs, useful for smoke tests.",
+    )
+    train.add_argument(
+        "--epochs",
+        type=int,
+        default=3,
+        help="Complete shuffled passes through all training passages.",
+    )
+    train.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=8,
+        help="Validation checks without meaningful improvement; 0 disables stopping.",
+    )
+    train.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=0.005,
+        help="Cumulative validation-loss improvement needed to reset patience.",
+    )
+    train.add_argument(
+        "--precision",
+        choices=["auto", "float32", "bfloat16"],
+        default="auto",
+        help="Auto uses BF16 on supported CUDA GPUs, otherwise FP32.",
     )
     train.add_argument(
         "--batch-size",
@@ -181,7 +225,7 @@ def parser():
     train.add_argument(
         "--eval-batches",
         type=int,
-        default=20,
+        default=128,
         help="Validation batches per evaluation; zero evaluates the full split.",
     )
     train.add_argument(
@@ -223,13 +267,13 @@ def parser():
     test.add_argument(
         "--data-dir",
         type=Path,
-        default=Path("data/prepared"),
+        default=Path("data/coherent/prepared"),
         help="The corpus used to train this model.",
     )
     test.add_argument(
         "--model-dir",
         type=Path,
-        default=Path("runs/tidbit/best"),
+        default=Path("runs/tidbit-coherent/best"),
         help="Local saved checkpoint or final model.",
     )
     test.add_argument(
@@ -274,7 +318,7 @@ def parser():
     generate.add_argument(
         "--model-dir",
         type=Path,
-        default=Path("runs/tidbit/best"),
+        default=Path("runs/tidbit-coherent/best"),
         help="Local saved checkpoint or final model.",
     )
     generate.add_argument(
@@ -290,7 +334,10 @@ def parser():
         help="Maximum generated tokens per prompt.",
     )
     generate.add_argument(
-        "--temperature", type=float, default=0.8, help="Positive sampling temperature."
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Sampling temperature; 0 selects greedy decoding.",
     )
     runtime_arguments(generate)
     return cli

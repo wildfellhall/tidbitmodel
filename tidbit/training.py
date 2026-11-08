@@ -8,6 +8,7 @@ Validation/test perplexity measures language modeling, not factual accuracy.
 import json
 import math
 import random
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -73,11 +74,11 @@ def read_prompts(path):
 
 
 def sample_responses(
-    model, tokenizer, prompts, device, max_new_tokens=64, temperature=0.8, seed=42
+    model, tokenizer, prompts, device, max_new_tokens=64, temperature=0.7, seed=42
 ):
     """Generate without consuming training RNG state or leaving dropout disabled."""
-    if max_new_tokens < 1 or temperature <= 0:
-        raise ValueError("max-new-tokens and temperature must be positive.")
+    if max_new_tokens < 1 or temperature < 0:
+        raise ValueError("max-new-tokens must be positive and temperature nonnegative.")
     previous_mode, previous_rng = model.training, rng_state(device)
     samples = []
     try:
@@ -86,20 +87,32 @@ def sample_responses(
         budget = min(max_new_tokens, model.config.n_positions - 1)
         with torch.inference_mode():
             for prompt in prompts:
-                ids = tokenizer.encode(prompt, add_special_tokens=False)
-                ids = (ids or [tokenizer.bos_token_id])[
-                    -(model.config.n_positions - budget) :
-                ]
+                # New passage tokenizers prepend BOS automatically. Preserve
+                # it when truncating, while supporting older saved tokenizers.
+                ids = tokenizer.encode(prompt) or [tokenizer.bos_token_id]
+                room = model.config.n_positions - budget
+                if len(ids) > room:
+                    if ids[0] == tokenizer.bos_token_id:
+                        ids = ids[:1] + (ids[-(room - 1) :] if room > 1 else [])
+                    else:
+                        ids = ids[-room:]
                 input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+                sampling = (
+                    {
+                        "temperature": temperature,
+                        "top_p": 0.9,
+                        "top_k": min(50, len(tokenizer)),
+                    }
+                    if temperature
+                    else {}
+                )
                 output = model.generate(
                     input_ids=input_ids,
                     attention_mask=torch.ones_like(input_ids),
                     max_new_tokens=budget,
-                    do_sample=True,
-                    temperature=temperature,
-                    top_p=0.9,
-                    top_k=min(50, len(tokenizer)),
-                    repetition_penalty=1.1,
+                    do_sample=bool(temperature),
+                    **sampling,
+                    repetition_penalty=1.05 if temperature else 1.0,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                     bad_words_ids=[[tokenizer.pad_token_id], [tokenizer.bos_token_id]],
@@ -130,7 +143,7 @@ def append_json(path, value):
         stream.write(json.dumps(value, ensure_ascii=False) + "\n")
 
 
-def evaluate(model, dataset, device, batch_size, max_batches=0):
+def evaluate(model, dataset, device, batch_size, max_batches=0, precision="float32"):
     """Token-weighted loss; padding and the first context token are not targets."""
     previous_mode = model.training
     total_loss, total_targets, batches = 0.0, 0, 0
@@ -154,7 +167,8 @@ def evaluate(model, dataset, device, batch_size, max_batches=0):
             for batch in loader:
                 batch = {key: value.to(device) for key, value in batch.items()}
                 targets = int((batch["labels"][:, 1:] != -100).sum().item())
-                loss = model(**batch, use_cache=False).loss.item()
+                with precision_context(device, precision):
+                    loss = model(**batch, use_cache=False).loss.item()
                 if not math.isfinite(loss):
                     raise ValueError("Non-finite evaluation loss.")
                 total_loss += loss * targets
@@ -196,12 +210,143 @@ def build_model(tokenizer, args):
         pad_token_id=tokenizer.pad_token_id,
     )
     # This constructor initializes random weights. No pretrained GPT-2 weights.
-    config._attn_implementation = "eager"
+    config._attn_implementation = getattr(args, "attention_implementation", "eager")
     return GPT2LMHeadModel(config)
 
 
+def precision_context(device, precision):
+    return (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if precision == "bfloat16"
+        else nullcontext()
+    )
+
+
+def configure_training(args, metadata):
+    if metadata.get("format_version") != 2:
+        raise ValueError(
+            "Prepare a new passage dataset (format 2) before training this version."
+        )
+    if args.context != metadata["context"]:
+        raise ValueError("Training context must match the prepared passage context.")
+    if args.epochs < 1 or args.batch_size < 1 or args.gradient_accumulation < 1:
+        raise ValueError("Epochs and batch sizes must be positive.")
+    args.steps_per_epoch = math.ceil(
+        metadata["passage_counts"]["train"]
+        / (args.batch_size * args.gradient_accumulation)
+    )
+    if args.max_steps is None:
+        args.max_steps = args.epochs * args.steps_per_epoch
+    device = choose_device(args.device)
+    capable = device.type == "cuda" and torch.cuda.is_bf16_supported()
+    if args.precision == "auto":
+        args.precision = "bfloat16" if capable else "float32"
+    if args.precision == "bfloat16" and not capable:
+        raise ValueError(
+            "BF16 training requires a supported CUDA GPU; use precision='float32'."
+        )
+    args.attention_implementation = "sdpa" if device.type == "cuda" else "eager"
+
+
+def training_configuration(args):
+    return {
+        name: getattr(args, name)
+        for name in (
+            "context",
+            "width",
+            "layers",
+            "heads",
+            "dropout",
+            "batch_size",
+            "gradient_accumulation",
+            "max_steps",
+            "epochs",
+            "learning_rate",
+            "weight_decay",
+            "warmup_steps",
+            "seed",
+            "precision",
+            "attention_implementation",
+            "eval_every",
+            "eval_batches",
+            "early_stopping_patience",
+            "early_stopping_min_delta",
+        )
+    } | {"training_version": 2}
+
+
+class ShuffledEpochSampler:
+    """Visit each passage once per epoch; save the permutation and cursor."""
+
+    def __init__(self, size, seed, lengths=None, batch_size=1):
+        self.size, self.epoch, self.cursor = size, 0, 0
+        self.generator = torch.Generator().manual_seed(seed)
+        self.lengths = None if lengths is None else torch.as_tensor(lengths.copy())
+        self.batch_size = batch_size
+        self.order = self.make_order()
+
+    def make_order(self):
+        order = torch.randperm(self.size, generator=self.generator)
+        if self.lengths is None:
+            return order
+        # Sort small shuffled pools by length, then shuffle full batch groups.
+        # Every passage is still visited exactly once. Similar lengths reduce
+        # padding, without a corpus-wide shortest-to-longest curriculum.
+        batches, tail = [], []
+        for pool in order.split(self.batch_size * 128):
+            pool = pool[torch.argsort(self.lengths[pool], stable=True)]
+            for batch in pool.split(self.batch_size):
+                (batches if len(batch) == self.batch_size else tail).append(batch)
+        permutation = torch.randperm(len(batches), generator=self.generator).tolist()
+        return torch.cat([batches[i] for i in permutation] + tail)
+
+    @property
+    def progress(self):
+        return self.epoch + self.cursor / self.size
+
+    def take(self, count):
+        if self.cursor == self.size:
+            self.epoch += 1
+            self.cursor = 0
+            self.order = self.make_order()
+        stop = min(self.cursor + count, self.size)
+        indices = self.order[self.cursor : stop].tolist()
+        self.cursor = stop
+        return indices
+
+    def state_dict(self):
+        return {
+            "size": self.size,
+            "epoch": self.epoch,
+            "cursor": self.cursor,
+            "order": self.order.clone(),
+            "rng": self.generator.get_state(),
+        }
+
+    def load_state_dict(self, state):
+        if state["size"] != self.size:
+            raise ValueError("Checkpoint sampler has a different number of passages.")
+        self.epoch, self.cursor, self.order = (
+            state["epoch"],
+            state["cursor"],
+            state["order"],
+        )
+        self.generator.set_state(state["rng"])
+
+
 def save_checkpoint(
-    path, model, tokenizer, optimizer, scheduler, sampler, step, best_loss, run, device
+    path,
+    model,
+    tokenizer,
+    optimizer,
+    scheduler,
+    sampler,
+    step,
+    best_loss,
+    run,
+    device,
+    progress=None,
+    completed=False,
 ):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -215,8 +360,10 @@ def save_checkpoint(
             "best_validation_loss": best_loss,
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
-            "sampler_rng": sampler.get_state(),
+            "sampler": sampler.state_dict(),
             "rng": rng_state(device),
+            "progress": dict(progress or {}),
+            "completed": completed,
         },
         temporary,
     )
@@ -224,6 +371,9 @@ def save_checkpoint(
 
 
 def train(args):
+    output, data = Path(args.output_dir), Path(args.data_dir)
+    metadata = json.loads((data / "metadata.json").read_text())
+    configure_training(args, metadata)
     if (
         min(
             args.max_steps,
@@ -253,31 +403,18 @@ def train(args):
         )
     if args.learning_rate <= 0 or args.weight_decay < 0:
         raise ValueError("Learning rate must be positive and weight decay nonnegative.")
+    if args.early_stopping_patience < 0 or args.early_stopping_min_delta < 0:
+        raise ValueError("Early-stopping settings must be nonnegative.")
     if args.sample_max_new_tokens < 1:
         raise ValueError("sample-max-new-tokens must be positive.")
     prompts = read_prompts(args.sample_prompts)
-    output, data = Path(args.output_dir), Path(args.data_dir)
-    metadata = json.loads((data / "metadata.json").read_text())
     tokenizer = PreTrainedTokenizerFast.from_pretrained(
         data / "tokenizer", local_files_only=True
     )
     device = choose_device(args.device)
     torch.set_num_threads(args.threads)
     seed_everything(args.seed)
-    configuration = {
-        "context": args.context,
-        "width": args.width,
-        "layers": args.layers,
-        "heads": args.heads,
-        "dropout": args.dropout,
-        "batch_size": args.batch_size,
-        "gradient_accumulation": args.gradient_accumulation,
-        "max_steps": args.max_steps,
-        "learning_rate": args.learning_rate,
-        "weight_decay": args.weight_decay,
-        "warmup_steps": args.warmup_steps,
-        "seed": args.seed,
-    }
+    configuration = training_configuration(args)
     run = {
         "dataset_fingerprint": metadata["fingerprint"],
         "configuration": configuration,
@@ -286,6 +423,9 @@ def train(args):
         "sample_prompts": prompts,
         "sample_max_new_tokens": args.sample_max_new_tokens,
         "torch_version": str(torch.__version__),
+        "steps_per_epoch": args.steps_per_epoch,
+        "training_passages": metadata["passage_counts"]["train"],
+        "training_target_tokens": metadata["target_counts"]["train"],
     }
     state = None
     if args.resume:
@@ -298,7 +438,9 @@ def train(args):
                 "Resume requires the original training settings, including the planned max-steps."
             )
         model = GPT2LMHeadModel.from_pretrained(
-            checkpoint, local_files_only=True, attn_implementation="eager"
+            checkpoint,
+            local_files_only=True,
+            attn_implementation=args.attention_implementation,
         )
         state = torch.load(
             checkpoint / "training_state.pt", map_location="cpu", weights_only=True
@@ -330,7 +472,7 @@ def train(args):
         },
         {"params": [p for p in model.parameters() if p.ndim < 2], "weight_decay": 0.0},
     ]
-    optimizer = torch.optim.AdamW(groups, lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(groups, lr=args.learning_rate, betas=(0.9, 0.95))
     warmup = min(args.warmup_steps, max(0, args.max_steps - 1))
 
     def learning_rate_factor(step):
@@ -340,19 +482,30 @@ def train(args):
         return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_factor)
-    sampler = torch.Generator().manual_seed(args.seed + 1)
+    sampler = ShuffledEpochSampler(
+        len(training),
+        args.seed + 1,
+        np.diff(training.offsets),
+        args.batch_size * args.gradient_accumulation,
+    )
+    progress = {
+        "target_tokens_seen": 0,
+        "bad_evaluations": 0,
+        "patience_reference_loss": float("inf"),
+    }
     start, best_loss = 0, float("inf")
     if state:
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
-        sampler.set_state(state["sampler_rng"])
+        sampler.load_state_dict(state["sampler"])
+        progress.update(state["progress"])
         restore_rng(state["rng"], device)
         start, best_loss = state["step"], state["best_validation_loss"]
         # A resumed run in a new directory needs its own best checkpoint.
         # The previous best model may belong to an earlier, unavailable step.
         if not (output / "best" / "training_state.pt").exists():
             best_loss = float("inf")
-    if start >= args.max_steps:
+    if start >= args.max_steps or (state and state.get("completed")):
         raise ValueError("This checkpoint already reached the planned max-steps.")
     print(
         f"Training {run['parameters']:,} randomly initialized parameters on {device}; samples every {SAMPLE_EVERY} optimizer steps.",
@@ -362,36 +515,50 @@ def train(args):
         f"Train tokens: {len(training.tokens):,}; validation tokens: {len(validation.tokens):,}",
         flush=True,
     )
+    print(
+        f"Planned updates: {args.max_steps:,}; {args.steps_per_epoch:,} per complete shuffled epoch; precision={args.precision}.",
+        flush=True,
+    )
+    stopped_early = False
     model.train()
     for step in range(start + 1, args.max_steps + 1):
         optimizer.zero_grad(set_to_none=True)
         microbatches = []
-        for _ in range(args.gradient_accumulation):
-            indices = torch.randint(
-                len(training), (args.batch_size,), generator=sampler
-            ).tolist()
+        update_indices = sampler.take(args.batch_size * args.gradient_accumulation)
+        for offset in range(0, len(update_indices), args.batch_size):
+            indices = update_indices[offset : offset + args.batch_size]
             rows = [training[index] for index in indices]
             batch = {key: torch.stack([row[key] for row in rows]) for key in rows[0]}
+            # Right-padding only to this microbatch's longest passage saves work.
+            length = int(batch["attention_mask"].sum(dim=1).max())
+            batch = {key: value[:, :length] for key, value in batch.items()}
             targets = int((batch["labels"][:, 1:] != -100).sum().item())
             microbatches.append((batch, targets))
         total_targets = sum(targets for _, targets in microbatches)
         train_loss = 0.0
         for batch, targets in microbatches:
             batch = {key: value.to(device) for key, value in batch.items()}
-            loss = model(**batch, use_cache=False).loss
+            with precision_context(device, args.precision):
+                loss = model(**batch, use_cache=False).loss
             if not torch.isfinite(loss):
                 raise ValueError(f"Non-finite training loss at step {step}.")
             weight = targets / total_targets
             (loss * weight).backward()
             train_loss += loss.detach().item() * weight
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), 1.0, error_if_nonfinite=True
+        )
         optimizer.step()
         scheduler.step()
+        progress["target_tokens_seen"] += total_targets
         if step == 1 or step % args.log_every == 0 or step == args.max_steps:
             metrics = {
                 "step": step,
                 "train_loss": train_loss,
                 "learning_rate": scheduler.get_last_lr()[0],
+                "epochs_completed": sampler.progress,
+                "target_tokens_seen": progress["target_tokens_seen"],
+                "gradient_norm": float(grad_norm),
             }
             print(json.dumps(metrics), flush=True)
             append_json(output / "metrics.jsonl", metrics)
@@ -405,13 +572,45 @@ def train(args):
                 seed=args.seed,
             )
             show_samples(samples, step)
-            append_json(output / "samples.jsonl", {"step": step, "samples": samples})
+            greedy = sample_responses(
+                model,
+                tokenizer,
+                prompts,
+                device,
+                args.sample_max_new_tokens,
+                temperature=0,
+                seed=args.seed,
+            )
+            print("Greedy comparison (no sampling):", flush=True)
+            show_samples(greedy, step)
+            append_json(
+                output / "samples.jsonl",
+                {
+                    "step": step,
+                    "epochs_completed": sampler.progress,
+                    "samples": samples,
+                    "greedy_samples": greedy,
+                },
+            )
         if step % args.eval_every == 0 or step == args.max_steps:
             metrics = evaluate(
-                model, validation, device, args.batch_size, args.eval_batches
+                model,
+                validation,
+                device,
+                args.batch_size,
+                args.eval_batches,
+                args.precision,
             )
             print(f"Validation at step {step}: {json.dumps(metrics)}", flush=True)
             append_json(output / "metrics.jsonl", {"step": step, "validation": metrics})
+            if (
+                metrics["loss"]
+                < progress["patience_reference_loss"] - args.early_stopping_min_delta
+            ):
+                progress["patience_reference_loss"] = metrics["loss"]
+                progress["bad_evaluations"] = 0
+            else:
+                progress["bad_evaluations"] += 1
             if metrics["loss"] < best_loss:
                 best_loss = metrics["loss"]
                 save_checkpoint(
@@ -425,7 +624,19 @@ def train(args):
                     best_loss,
                     run,
                     device,
+                    progress,
                 )
+            if (
+                args.early_stopping_patience
+                and sampler.progress >= 1
+                and progress["bad_evaluations"] >= args.early_stopping_patience
+            ):
+                stopped_early = True
+                print(
+                    "Stopping: validation loss has stopped improving meaningfully.",
+                    flush=True,
+                )
+                break
         if step % args.save_every == 0:
             save_checkpoint(
                 output / f"checkpoint-{step}",
@@ -438,6 +649,7 @@ def train(args):
                 best_loss,
                 run,
                 device,
+                progress,
             )
     save_checkpoint(
         output / "model",
@@ -450,6 +662,20 @@ def train(args):
         best_loss,
         run,
         device,
+        progress,
+        completed=True,
+    )
+    write_json(
+        output / "training_summary.json",
+        {
+            "steps": step,
+            "planned_steps": args.max_steps,
+            "epochs_completed": sampler.progress,
+            "target_tokens_seen": progress["target_tokens_seen"],
+            "best_validation_loss": best_loss,
+            "stopped_early": stopped_early,
+            "note": "Validation loss and sample comparisons are diagnostics, not a guarantee of coherence or factual accuracy.",
+        },
     )
     print(
         f"Saved final model to {output / 'model'}; best validation checkpoint to {output / 'best'}.",
