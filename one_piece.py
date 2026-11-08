@@ -1,23 +1,5 @@
 #!/usr/bin/env python3
 """One self-contained Python cell for the historical tidbits project.
-
-Run `python one_piece.py`, or paste this ENTIRE file into one notebook cell.
-Edit CONFIG below before running. No corpus.py, sample_prompts.json, project
-modules, command-line arguments, or __file__ variable are needed at runtime.
-Missing dependencies are installed automatically when enabled below.
-
-The default sequence prepares the embedded books, trains a fresh ~10.1M GPT-2,
-evaluates held-out text, then accepts your prompts until you enter /quit.
-Sample responses print and save every 100 OPTIMIZER steps. A repeated run
-reuses matching prepared data and a finished model, or resumes the latest
-compatible saved checkpoint. Choose new data/output directories for a new
-corpus or training configuration. Downloads and model files stay local.
-
-For prompt testing alone, set prepare/train/evaluate to False and interactive
-to True; set model_dir if your saved model is outside output_dir/best.
-Training learns historical text continuations. Perplexity is not a factual
-accuracy score. The default 10,000-step training run is a real training job;
-reduce max_steps and max_sources (at least 3) for a quick experiment.
 """
 
 # Imports from the Python standard library.
