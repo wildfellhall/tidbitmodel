@@ -74,11 +74,26 @@ def read_prompts(path):
 
 
 def sample_responses(
-    model, tokenizer, prompts, device, max_new_tokens=64, temperature=0.7, seed=42
+    model,
+    tokenizer,
+    prompts,
+    device,
+    max_new_tokens=64,
+    temperature=0.7,
+    seed=42,
+    *,
+    repetition_penalty=None,
+    no_repeat_ngram_size=0,
 ):
     """Generate without consuming training RNG state or leaving dropout disabled."""
     if max_new_tokens < 1 or temperature < 0:
         raise ValueError("max-new-tokens must be positive and temperature nonnegative.")
+    if repetition_penalty is None:
+        repetition_penalty = 1.05 if temperature else 1.0
+    if not math.isfinite(repetition_penalty) or repetition_penalty <= 0:
+        raise ValueError("repetition_penalty must be finite and positive.")
+    if not isinstance(no_repeat_ngram_size, int) or no_repeat_ngram_size < 0:
+        raise ValueError("no_repeat_ngram_size must be a nonnegative integer.")
     previous_mode, previous_rng = model.training, rng_state(device)
     samples = []
     try:
@@ -112,7 +127,8 @@ def sample_responses(
                     max_new_tokens=budget,
                     do_sample=bool(temperature),
                     **sampling,
-                    repetition_penalty=1.05 if temperature else 1.0,
+                    repetition_penalty=repetition_penalty,
+                    no_repeat_ngram_size=no_repeat_ngram_size,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                     bad_words_ids=[[tokenizer.pad_token_id], [tokenizer.bos_token_id]],
@@ -128,9 +144,10 @@ def sample_responses(
     return samples
 
 
-def show_samples(samples, step=None):
+def show_samples(samples, step=None, mode=None):
     label = f" at step {step}" if step is not None else ""
-    print(f"\n--- Sample responses{label} ---", flush=True)
+    description = f" [{mode}]" if mode else ""
+    print(f"\n--- Sample responses{label}{description} ---", flush=True)
     for sample in samples:
         print(
             f"Prompt: {sample['prompt']}\nResponse: {sample['continuation']}\n",
@@ -658,7 +675,7 @@ def train(args):
                 args.sample_max_new_tokens,
                 seed=args.seed,
             )
-            show_samples(samples, step)
+            show_samples(samples, step, mode="sampled; temperature=0.7")
             greedy = sample_responses(
                 model,
                 tokenizer,
@@ -668,8 +685,11 @@ def train(args):
                 temperature=0,
                 seed=args.seed,
             )
-            print("Greedy comparison (no sampling):", flush=True)
-            show_samples(greedy, step)
+            print(
+                "Greedy comparison (diagnostic; no sampling or repetition controls):",
+                flush=True,
+            )
+            show_samples(greedy, step, mode="raw greedy diagnostic")
             append_json(
                 output / "samples.jsonl",
                 {
@@ -781,6 +801,49 @@ def load_model(path, device):
     return model.to(device), tokenizer
 
 
+def compare_decoding(
+    model_dir, prompts, device="auto", max_new_tokens=48, seed=42, threads=4
+):
+    """Compare token-selection methods on saved weights without training or saving.
+
+    Repetition controls can suppress a loop; they do not establish that the
+    model learned a correct fact. Raw modes retain the training diagnostics.
+    """
+    if threads < 1:
+        raise ValueError("threads must be positive.")
+    torch.set_num_threads(threads)
+    device = choose_device(device)
+    prompts = [prompts] if isinstance(prompts, str) else list(prompts)
+    if not prompts or not all(isinstance(p, str) for p in prompts):
+        raise ValueError("Provide at least one prompt string.")
+    model, tokenizer = load_model(model_dir, device)
+    results = []
+    for label, settings in (
+        (
+            "raw greedy diagnostic",
+            {"temperature": 0, "repetition_penalty": 1.0, "no_repeat_ngram_size": 0},
+        ),
+        (
+            "sampled training baseline",
+            {"temperature": 0.7, "repetition_penalty": 1.05, "no_repeat_ngram_size": 0},
+        ),
+        (
+            "sampled with repetition controls",
+            {"temperature": 0.8, "repetition_penalty": 1.15, "no_repeat_ngram_size": 4},
+        ),
+    ):
+        samples = sample_responses(
+            model, tokenizer, prompts, device, max_new_tokens, seed=seed, **settings
+        )
+        show_samples(samples, mode=label)
+        results.append({"mode": label, "settings": settings, "samples": samples})
+    return {
+        "checkpoint": str(model_dir),
+        "max_new_tokens": max_new_tokens,
+        "comparisons": results,
+    }
+
+
 def test_model(args):
     if args.batch_size < 1 or args.max_batches < 0 or args.threads < 1:
         raise ValueError(
@@ -831,6 +894,15 @@ def test_model(args):
 def generate(args):
     if args.threads < 1:
         raise ValueError("threads must be positive.")
+    if args.compare_decoding:
+        return compare_decoding(
+            args.model_dir,
+            args.prompt,
+            args.device,
+            args.max_new_tokens,
+            args.seed,
+            args.threads,
+        )
     torch.set_num_threads(args.threads)
     device = choose_device(args.device)
     model, tokenizer = load_model(args.model_dir, device)
@@ -842,5 +914,10 @@ def generate(args):
         args.max_new_tokens,
         args.temperature,
         args.seed,
+        repetition_penalty=args.repetition_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
     )
-    show_samples(samples)
+    show_samples(
+        samples,
+        mode=f"temperature={args.temperature}; repetition_penalty={args.repetition_penalty}; no_repeat_ngram_size={args.no_repeat_ngram_size}",
+    )

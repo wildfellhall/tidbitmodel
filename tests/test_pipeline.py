@@ -29,6 +29,7 @@ from tidbit.data import (
 from tidbit.training import (
     ShuffledEpochSampler,
     build_model,
+    compare_decoding,
     sample_responses,
     train,
     update_parameters,
@@ -333,6 +334,59 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(ids[0], tokenizer.bos_token_id)
             self.assertLessEqual(len(ids) + 8, model.config.n_positions)
             self.assertEqual(ids.count(tokenizer.bos_token_id), 1)
+
+    def test_repetition_controls_break_a_loop_without_changing_raw_greedy(self):
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(self.data / "tokenizer")
+        model = build_model(tokenizer, self.training_args(self.root / "unused"))
+        favored = tokenizer.convert_tokens_to_ids("x")
+
+        class RepeatingHead(torch.nn.Module):
+            def forward(self, hidden):
+                logits = hidden.new_full((*hidden.shape[:-1], len(tokenizer)), -20.0)
+                logits[..., favored] = 20.0
+                logits[..., tokenizer.eos_token_id] = 0.0
+                return logits
+
+        # A known looping distribution tests the actual HF decoding processors.
+        model.lm_head = RepeatingHead()
+        before = torch.get_rng_state().clone()
+        raw = sample_responses(model, tokenizer, [""], torch.device("cpu"), 16, 0)
+        guarded = sample_responses(
+            model,
+            tokenizer,
+            [""],
+            torch.device("cpu"),
+            16,
+            0,
+            repetition_penalty=1.15,
+            no_repeat_ngram_size=4,
+        )
+        self.assertEqual(raw[0]["continuation"], "x" * 16)
+        self.assertEqual(guarded[0]["continuation"], "x" * 4)
+        self.assertTrue(model.training)
+        self.assertTrue(torch.equal(before, torch.get_rng_state()))
+
+    def test_compare_decoding_reads_existing_checkpoint_without_changing_it(self):
+        path = self.root / "decode-checkpoint"
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(self.data / "tokenizer")
+        model = build_model(tokenizer, self.training_args(path))
+        model.save_pretrained(path)
+        tokenizer.save_pretrained(path)
+        before = {p.name: p.read_bytes() for p in path.iterdir()}
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            report = compare_decoding(
+                path, "A definition", device="cpu", max_new_tokens=6, threads=1
+            )
+        self.assertEqual(len(report["comparisons"]), 3)
+        self.assertIn("raw greedy diagnostic", output.getvalue())
+        self.assertIn("sampled with repetition controls", output.getvalue())
+        self.assertEqual(
+            report["comparisons"][0]["settings"]["no_repeat_ngram_size"], 0
+        )
+        self.assertEqual(
+            report["comparisons"][2]["settings"]["no_repeat_ngram_size"], 4
+        )
+        self.assertEqual(before, {p.name: p.read_bytes() for p in path.iterdir()})
 
     def test_passages_preserve_tokens_and_do_not_teach_eos_at_hard_cuts(self):
         tokenizer = PreTrainedTokenizerFast.from_pretrained(self.data / "tokenizer")

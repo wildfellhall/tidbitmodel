@@ -354,14 +354,31 @@ def parser():
     generate.add_argument(
         "--max-new-tokens",
         type=int,
-        default=64,
+        default=48,
         help="Maximum generated tokens per prompt.",
     )
     generate.add_argument(
         "--temperature",
         type=float,
-        default=0.7,
+        default=0.8,
         help="Sampling temperature; 0 selects greedy decoding.",
+    )
+    generate.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.15,
+        help="Penalty on previously seen tokens; 1 disables it.",
+    )
+    generate.add_argument(
+        "--no-repeat-ngram-size",
+        type=int,
+        default=4,
+        help="Block repeated token n-grams; 0 disables blocking. This does not ensure correctness.",
+    )
+    generate.add_argument(
+        "--compare-decoding",
+        action="store_true",
+        help="Compare raw greedy, baseline sampling, and sampling with repetition controls on the same checkpoint.",
     )
     runtime_arguments(generate)
     return cli
