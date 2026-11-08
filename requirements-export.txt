@@ -1,0 +1,5 @@
+# Install only when exporting; the converter's GGUF package comes from its pinned checkout.
+-r requirements.txt
+numpy>=2.2.6,<3
+huggingface_hub>=1.4,<2
+PyYAML>=6,<7
